@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>FSK Paint - おえかき通信</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+            background: #0f0f1a; color: #e0e0e0;
+            min-height: 100vh; padding: 12px;
+            display: flex; flex-direction: column; align-items: center;
+        }
+        h1 { font-size: 1.2rem; color: #00d4aa; margin-bottom: 8px; }
+        .status-bar {
+            display: flex; align-items: center; gap: 8px;
+            padding: 6px 12px; background: #1a1a2e; border-radius: 8px;
+            margin-bottom: 8px; font-size: 0.8rem; width: 100%; max-width: 400px;
+        }
+        .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #555; }
+        .status-dot.connected { background: #00d4aa; box-shadow: 0 0 4px #00d4aa; }
+        .canvas-area {
+            display: flex; gap: 12px; align-items: flex-start;
+            flex-wrap: wrap; justify-content: center; margin-bottom: 8px;
+        }
+        .canvas-box { text-align: center; }
+        .canvas-box label { font-size: 0.75rem; color: #888; display: block; margin-bottom: 4px; }
+        canvas.draw { border: 2px solid #333; border-radius: 4px; cursor: crosshair; touch-action: none; }
+        canvas.recv { border: 2px solid #1a3a2e; border-radius: 4px; }
+        .palette {
+            display: flex; gap: 4px; margin: 8px 0; justify-content: center; flex-wrap: wrap;
+        }
+        .palette .swatch {
+            width: 28px; height: 28px; border-radius: 4px; border: 2px solid transparent;
+            cursor: pointer;
+        }
+        .palette .swatch.active { border-color: #fff; box-shadow: 0 0 6px #fff; }
+        .btn-row { display: flex; gap: 8px; margin: 8px 0; flex-wrap: wrap; justify-content: center; }
+        button {
+            padding: 10px 16px; border: none; border-radius: 6px;
+            font-size: 0.85rem; font-weight: 600; cursor: pointer;
+            transition: transform 0.1s;
+        }
+        button:active { transform: scale(0.95); }
+        button:disabled { opacity: 0.4; cursor: not-allowed; }
+        .btn-connect { background: #0f3460; color: #e0e0e0; }
+        .btn-connect.connected { background: #1a3a2a; color: #00d4aa; }
+        .btn-send { background: #00d4aa; color: #0f0f1a; }
+        .btn-clear { background: #333; color: #e0e0e0; }
+        .log { font-size: 0.75rem; color: #888; margin-top: 8px; max-width: 400px; text-align: center; min-height: 20px; }
+        .progress { width: 100%; max-width: 400px; height: 4px; background: #222; border-radius: 2px; margin-top: 4px; overflow: hidden; }
+        .progress-bar { height: 100%; background: #00d4aa; width: 0%; transition: width 0.3s; }
+    </style>
+</head>
+<body>
+    <h1>🎨 おえかき通信</h1>
+    <div class="status-bar">
+        <div class="status-dot" id="statusDot"></div>
+        <span id="statusText">Disconnected</span>
+        <button class="btn-connect" id="btnConnect">🎤 Connect</button>
+    </div>
+
+    <div class="device-select" style="width:100%;max-width:400px;margin-bottom:8px;">
+        <select id="outputSelect" style="width:100%;padding:8px;background:#1a1a2e;color:#e0e0e0;border:1px solid #333;border-radius:6px;font-size:0.8rem;">
+            <option value="">-- Audio Output (speaker) --</option>
+        </select>
+    </div>
+
+    <div class="canvas-area">
+        <div class="canvas-box">
+            <label>おえかき (32×32)</label>
+            <canvas class="draw" id="drawCanvas" width="192" height="192"></canvas>
+        </div>
+        <div class="canvas-box">
+            <label>受信画像</label>
+            <canvas class="recv" id="recvCanvas" width="192" height="192"></canvas>
+        </div>
+    </div>
+
+    <div class="palette" id="palette"></div>
+
+    <div class="btn-row">
+        <button class="btn-clear" id="btnClear">🗑 Clear</button>
+        <button class="btn-send" id="btnSend" disabled>📤 Send</button>
+    </div>
+
+    <div class="progress"><div class="progress-bar" id="progressBar"></div></div>
+    <div class="log" id="log"></div>
+
+    <script type="module" src="paint.js"></script>
+</body>
+</html>

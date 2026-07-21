@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>USB Type-C FSK Modem</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f0f1a;
+            color: #e0e0e0;
+            min-height: 100vh;
+            padding: 16px;
+            padding-bottom: env(safe-area-inset-bottom, 16px);
+        }
+
+        .container {
+            max-width: 480px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            text-align: center;
+            font-size: 1.4rem;
+            color: #00d4aa;
+            margin-bottom: 16px;
+        }
+
+        .status-bar {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 10px 14px;
+            background: #1a1a2e;
+            border-radius: 10px;
+            margin-bottom: 12px;
+            font-size: 0.85rem;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #555;
+            flex-shrink: 0;
+        }
+
+        .status-dot.connected {
+            background: #00d4aa;
+            box-shadow: 0 0 6px #00d4aa;
+        }
+
+        .status-dot.error {
+            background: #ff4757;
+            box-shadow: 0 0 6px #ff4757;
+        }
+
+        .status-text {
+            flex: 1;
+            color: #aaa;
+        }
+
+        .indicator-group {
+            display: flex;
+            gap: 8px;
+        }
+
+        .indicator {
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: bold;
+            background: #222;
+            color: #555;
+        }
+
+        .indicator.active-tx {
+            background: #1a3a1a;
+            color: #4caf50;
+        }
+
+        .indicator.active-rx {
+            background: #1a1a3a;
+            color: #42a5f5;
+        }
+
+        .section {
+            background: #1a1a2e;
+            border-radius: 10px;
+            padding: 14px;
+            margin-bottom: 12px;
+        }
+
+        .section-title {
+            font-size: 0.8rem;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 10px;
+        }
+
+        select, input[type="text"] {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #333;
+            border-radius: 8px;
+            background: #0f0f1a;
+            color: #e0e0e0;
+            font-size: 16px;
+            -webkit-appearance: none;
+            appearance: none;
+        }
+
+        select {
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23888' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 12px center;
+            padding-right: 36px;
+        }
+
+        button {
+            width: 100%;
+            padding: 14px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.15s, transform 0.1s;
+            -webkit-tap-highlight-color: transparent;
+        }
+
+        button:active {
+            transform: scale(0.97);
+        }
+
+        button:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .btn-connect {
+            background: #0f3460;
+            color: #e0e0e0;
+            margin-top: 10px;
+        }
+
+        .btn-connect.connected {
+            background: #1a3a2a;
+            color: #00d4aa;
+        }
+
+        .btn-send {
+            background: #00d4aa;
+            color: #0f0f1a;
+            margin-top: 10px;
+        }
+
+        .send-row {
+            display: flex;
+            gap: 8px;
+            align-items: stretch;
+        }
+
+        .send-row input {
+            flex: 1;
+        }
+
+        .send-row button {
+            width: auto;
+            padding: 12px 20px;
+            margin-top: 0;
+            white-space: nowrap;
+        }
+
+        .rx-log {
+            background: #0a0a14;
+            border: 1px solid #222;
+            border-radius: 8px;
+            padding: 10px;
+            min-height: 120px;
+            max-height: 240px;
+            overflow-y: auto;
+            font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
+            font-size: 0.85rem;
+            line-height: 1.5;
+            -webkit-overflow-scrolling: touch;
+        }
+
+        .rx-log .msg {
+            padding: 2px 0;
+            border-bottom: 1px solid #1a1a2e;
+        }
+
+        .rx-log .msg:last-child {
+            border-bottom: none;
+        }
+
+        .rx-log .msg-time {
+            color: #555;
+            font-size: 0.75rem;
+            margin-right: 6px;
+        }
+
+        .rx-log .msg-data {
+            color: #42a5f5;
+        }
+
+        .rx-log .msg-error {
+            color: #ff4757;
+        }
+
+        .rx-log .msg-info {
+            color: #888;
+        }
+
+        .device-select {
+            margin-bottom: 10px;
+        }
+
+        @media (max-width: 380px) {
+            body { padding: 10px; }
+            h1 { font-size: 1.2rem; }
+            .section { padding: 10px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔌 FSK Modem</h1>
+
+        <!-- Status Bar -->
+        <div class="status-bar">
+            <div class="status-dot" id="statusDot"></div>
+            <span class="status-text" id="statusText">Disconnected</span>
+            <div class="indicator-group">
+                <span class="indicator" id="txIndicator">TX</span>
+                <span class="indicator" id="rxIndicator">RX</span>
+            </div>
+        </div>
+
+        <!-- Connection Section -->
+        <div class="section">
+            <div class="section-title">Audio Device</div>
+            <div class="device-select">
+                <select id="deviceSelect" disabled>
+                    <option value="">-- Connect first --</option>
+                </select>
+            </div>
+            <button class="btn-connect" id="btnConnect">
+                🎤 Connect Audio
+            </button>
+        </div>
+
+        <!-- Send Section -->
+        <div class="section">
+            <div class="section-title">Send</div>
+            <div class="send-row">
+                <input type="text" id="sendInput" placeholder="Enter text..." disabled>
+                <button class="btn-send" id="btnSend" disabled>📤 Send</button>
+            </div>
+        </div>
+
+        <!-- Receive Section -->
+        <div class="section">
+            <div class="section-title">Received</div>
+            <div class="rx-log" id="rxLog">
+                <div class="msg"><span class="msg-info">Waiting for connection...</span></div>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="fsk-modem.js"></script>
+</body>
+</html>

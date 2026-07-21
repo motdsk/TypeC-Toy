@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FSK Modem Loopback Test</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #0f0f1a; color: #e0e0e0;
+            min-height: 100vh; padding: 20px;
+        }
+        .container { max-width: 600px; margin: 0 auto; }
+        h1 { color: #00d4aa; text-align: center; margin-bottom: 20px; font-size: 1.3rem; }
+        .section {
+            background: #1a1a2e; border-radius: 10px;
+            padding: 14px; margin-bottom: 12px;
+        }
+        .section-title {
+            font-size: 0.8rem; color: #888;
+            text-transform: uppercase; margin-bottom: 10px;
+        }
+        button {
+            width: 100%; padding: 14px; border: none; border-radius: 8px;
+            font-size: 1rem; font-weight: 600; cursor: pointer;
+            margin-top: 8px; transition: background 0.15s;
+        }
+        button:disabled { opacity: 0.4; cursor: not-allowed; }
+        .btn-test { background: #00d4aa; color: #0f0f1a; }
+        .btn-test:hover:not(:disabled) { background: #00eebb; }
+        input[type="text"] {
+            width: 100%; padding: 12px; border: 1px solid #333;
+            border-radius: 8px; background: #0f0f1a; color: #e0e0e0;
+            font-size: 16px;
+        }
+        .log {
+            background: #0a0a14; border: 1px solid #222; border-radius: 8px;
+            padding: 10px; min-height: 150px; max-height: 300px;
+            overflow-y: auto; font-family: monospace; font-size: 0.85rem;
+            line-height: 1.6;
+        }
+        .log-ok { color: #4caf50; }
+        .log-err { color: #ff4757; }
+        .log-info { color: #42a5f5; }
+        .log-data { color: #ffc107; }
+        .stats { display: flex; gap: 20px; margin-top: 10px; font-size: 0.9rem; }
+        .stat-item { text-align: center; }
+        .stat-value { font-size: 1.5rem; font-weight: bold; color: #00d4aa; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>🔄 FSK Loopback Test</h1>
+    <p style="text-align:center;color:#888;margin-bottom:16px;font-size:0.85rem;">
+        ブラウザ内部でFSKエンコード→デコードのラウンドトリップを検証<br>
+        物理デバイス不要（AudioWorklet内部接続）
+    </p>
+
+    <div class="section">
+        <div class="section-title">Send Test Message</div>
+        <input type="text" id="inputMsg" value="Hello USB TypeC!" placeholder="テスト文字列を入力">
+        <button class="btn-test" id="btnSingle" onclick="sendSingle()">1回送信テスト</button>
+        <button class="btn-test" id="btnBurst" onclick="sendBurst()" style="background:#0f3460;color:#eee;">
+            連続10回送信テスト
+        </button>
+    </div>
+
+    <div class="section">
+        <div class="section-title">Statistics</div>
+        <div class="stats">
+            <div class="stat-item"><div class="stat-value" id="statSent">0</div>Sent</div>
+            <div class="stat-item"><div class="stat-value" id="statOk">0</div>OK</div>
+            <div class="stat-item"><div class="stat-value" id="statErr">0</div>Error</div>
+            <div class="stat-item"><div class="stat-value" id="statRate">-</div>Rate</div>
+        </div>
+    </div>
+
+    <div class="section">
+        <div class="section-title">Log</div>
+        <div class="log" id="log"></div>
+    </div>
+</div>
+
+<script type="module">
+// ===========================================================================
+// FSK Parameters (must match ESP32 side)
+// ===========================================================================
+const SAMPLE_RATE = 48000;
+const MARK_FREQ = 1200;   // bit '1'
+const SPACE_FREQ = 2200;  // bit '0'
+const SAMPLES_PER_BIT = 40; // 48000/1200
+const PREAMBLE = [0xAA, 0xAA];
+const SYNC_BYTE = 0x7E;
+
+// ===========================================================================
+// CRC-16-CCITT (poly 0x1021, init 0xFFFF)
+// ===========================================================================
+function crc16(data) {
+    let crc = 0xFFFF;
+    for (let i = 0; i < data.length; i++) {
+        crc ^= (data[i] << 8) & 0xFFFF;
+        for (let bit = 0; bit < 8; bit++) {
+            crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) & 0xFFFF : (crc << 1) & 0xFFFF;
+        }
+    }
+    return crc;
+}
+
+// ===========================================================================
+// Frame Encode
+// ===========================================================================
+function encodeFrame(payload) {
+    const len = payload.length;
+    const frame = new Uint8Array(len + 6);
+    let i = 0;
+    frame[i++] = 0xAA; frame[i++] = 0xAA; // preamble
+    frame[i++] = 0x7E; // sync
+    frame[i++] = len;  // length
+    for (let j = 0; j < len; j++) frame[i++] = payload[j];
+    const crcData = new Uint8Array(len + 1);
+    crcData[0] = len;
+    crcData.set(payload, 1);
+    const c = crc16(crcData);
+    frame[i++] = (c >> 8) & 0xFF;
+    frame[i++] = c & 0xFF;
+    return frame;
+}
+
+// ===========================================================================
+// FSK Encoder (generates Float32 PCM samples)
+// ===========================================================================
+function fskEncode(frameBytes) {
+    const totalBits = frameBytes.length * 8;
+    const totalSamples = totalBits * SAMPLES_PER_BIT;
+    const samples = new Float32Array(totalSamples);
+    let phase = 0;
+    let sampleIdx = 0;
+
+    for (let byteIdx = 0; byteIdx < frameBytes.length; byteIdx++) {
+        for (let bitIdx = 7; bitIdx >= 0; bitIdx--) {
+            const bit = (frameBytes[byteIdx] >> bitIdx) & 1;
+            const freq = bit ? MARK_FREQ : SPACE_FREQ;
+            const phaseInc = (2 * Math.PI * freq) / SAMPLE_RATE;
+            for (let s = 0; s < SAMPLES_PER_BIT; s++) {
+                samples[sampleIdx++] = Math.sin(phase) * 0.7;
+                phase += phaseInc;
+                if (phase >= 2 * Math.PI) phase -= 2 * Math.PI;
+            }
+        }
+    }
+    return samples;
+}
+
+// ===========================================================================
+// FSK Decoder (Goertzel, processes Float32 samples)
+// ===========================================================================
+function fskDecode(samples) {
+    const N = SAMPLES_PER_BIT;
+    const kMark = MARK_FREQ * N / SAMPLE_RATE;
+    const kSpace = SPACE_FREQ * N / SAMPLE_RATE;
+    const coeffMark = 2 * Math.cos(2 * Math.PI * kMark / N);
+    const coeffSpace = 2 * Math.cos(2 * Math.PI * kSpace / N);
+
+    // Decode bits
+    const bits = [];
+    for (let offset = 0; offset + N <= samples.length; offset += N) {
+        let q1m = 0, q2m = 0, q1s = 0, q2s = 0;
+        for (let i = 0; i < N; i++) {
+            const s = samples[offset + i];
+            let q0 = coeffMark * q1m - q2m + s; q2m = q1m; q1m = q0;
+            q0 = coeffSpace * q1s - q2s + s; q2s = q1s; q1s = q0;
+        }
+        const magMark = q1m*q1m + q2m*q2m - coeffMark*q1m*q2m;
+        const magSpace = q1s*q1s + q2s*q2s - coeffSpace*q1s*q2s;
+        bits.push(magMark > magSpace ? 1 : 0);
+    }
+
+    // Assemble bytes
+    const bytes = [];
+    for (let i = 0; i + 7 < bits.length; i += 8) {
+        let b = 0;
+        for (let j = 0; j < 8; j++) b = (b << 1) | bits[i + j];
+        bytes.push(b);
+    }
+
+    // Find frame: scan for preamble + sync
+    const frames = [];
+    for (let i = 0; i < bytes.length - 5; i++) {
+        if (bytes[i] === 0xAA && bytes[i+1] === 0xAA && bytes[i+2] === 0x7E) {
+            const len = bytes[i+3];
+            if (i + 4 + len + 2 > bytes.length) break;
+            const payload = bytes.slice(i+4, i+4+len);
+            const crcH = bytes[i+4+len];
+            const crcL = bytes[i+4+len+1];
+            const receivedCrc = (crcH << 8) | crcL;
+            const crcData = [len, ...payload];
+            const expectedCrc = crc16(crcData);
+            frames.push({ payload, crcOk: receivedCrc === expectedCrc, receivedCrc, expectedCrc });
+            i += 4 + len + 2 - 1; // skip past this frame
+        }
+    }
+    return frames;
+}
+
+// ===========================================================================
+// UI Logic
+// ===========================================================================
+let statSent = 0, statOk = 0, statErr = 0;
+
+function log(msg, cls = 'info') {
+    const el = document.getElementById('log');
+    const time = new Date().toLocaleTimeString('ja-JP', {hour12:false});
+    el.innerHTML += `<div class="log-${cls}">[${time}] ${msg}</div>`;
+    el.scrollTop = el.scrollHeight;
+}
+
+function updateStats() {
+    document.getElementById('statSent').textContent = statSent;
+    document.getElementById('statOk').textContent = statOk;
+    document.getElementById('statErr').textContent = statErr;
+    document.getElementById('statRate').textContent = statSent > 0 ? Math.round(statOk/statSent*100)+'%' : '-';
+}
+
+function runTest(text) {
+    const payload = new TextEncoder().encode(text);
+    if (payload.length > 255) { log('Payload too large', 'err'); return; }
+
+    // Encode frame
+    const frame = encodeFrame(payload);
+    log(`TX frame: ${frame.length} bytes, payload: "${text}"`, 'info');
+
+    // FSK modulate
+    const samples = fskEncode(frame);
+    log(`FSK modulated: ${samples.length} samples (${(samples.length/SAMPLE_RATE*1000).toFixed(0)}ms)`, 'info');
+
+    // FSK demodulate (loopback - direct)
+    const decoded = fskDecode(samples);
+    statSent++;
+
+    if (decoded.length === 0) {
+        log('DECODE FAILED: no frame found', 'err');
+        statErr++;
+    } else {
+        const f = decoded[0];
+        if (f.crcOk) {
+            const text_out = new TextDecoder().decode(new Uint8Array(f.payload));
+            if (text_out === text) {
+                log(`✓ RX OK: "${text_out}"`, 'ok');
+                statOk++;
+            } else {
+                log(`✗ DATA MISMATCH: sent="${text}" got="${text_out}"`, 'err');
+                statErr++;
+            }
+        } else {
+            log(`✗ CRC ERROR: got 0x${f.receivedCrc.toString(16)} expected 0x${f.expectedCrc.toString(16)}`, 'err');
+            statErr++;
+        }
+    }
+    updateStats();
+}
+
+window.sendSingle = function() {
+    const text = document.getElementById('inputMsg').value || 'test';
+    runTest(text);
+};
+
+window.sendBurst = function() {
+    const base = document.getElementById('inputMsg').value || 'burst';
+    for (let i = 0; i < 10; i++) {
+        runTest(`${base} #${i+1}`);
+    }
+};
+
+// Initial log
+log('FSK Loopback Test ready. Click a button to run.', 'info');
+log(`Params: Mark=${MARK_FREQ}Hz Space=${SPACE_FREQ}Hz Rate=${SAMPLE_RATE}Hz Bits/symbol=${SAMPLES_PER_BIT}`, 'info');
+</script>
+</body>
+</html>
