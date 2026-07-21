@@ -271,9 +271,7 @@ async function connect() {
         audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
         if (audioContext.state === 'suspended') await audioContext.resume();
 
-        const constraints = { audio: { sampleRate: 48000, channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false } };
-        mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
-
+        // Encoder (TX) - always set up
         await audioContext.audioWorklet.addModule('fsk-encoder-worklet.js');
         encoderNode = new AudioWorkletNode(audioContext, 'fsk-encoder-processor', { outputChannelCount: [1] });
         encoderNode.port.onmessage = (e) => {
@@ -282,7 +280,7 @@ async function connect() {
         };
         encoderNode.connect(audioContext.destination);
 
-        // Set audio output to selected device (for sending FSK to UAC speaker)
+        // Set audio output to selected device
         const selectedOutput = outputSelect.value;
         if (selectedOutput && audioContext.setSinkId) {
             try {
@@ -292,12 +290,21 @@ async function connect() {
             }
         }
 
-        await audioContext.audioWorklet.addModule('fsk-decoder-worklet.js');
-        decoderNode = new AudioWorkletNode(audioContext, 'fsk-decoder-processor', { numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1 });
-        decoderNode.port.onmessage = (e) => handleRx(e.data);
+        // Decoder (RX) - optional, may fail on mobile if USB mic not accessible
+        try {
+            const constraints = { audio: { sampleRate: 48000, channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false } };
+            mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
 
-        const source = audioContext.createMediaStreamSource(mediaStream);
-        source.connect(decoderNode);
+            await audioContext.audioWorklet.addModule('fsk-decoder-worklet.js');
+            decoderNode = new AudioWorkletNode(audioContext, 'fsk-decoder-processor', { numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1 });
+            decoderNode.port.onmessage = (e) => handleRx(e.data);
+
+            const source = audioContext.createMediaStreamSource(mediaStream);
+            source.connect(decoderNode);
+            console.log('[RX] Decoder connected');
+        } catch (rxErr) {
+            console.warn('[RX] Decoder setup failed (send-only mode):', rxErr.message);
+        }
 
         isConnected = true;
         statusDot.classList.add('connected');
