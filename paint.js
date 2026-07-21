@@ -245,8 +245,6 @@ function setLog(msg) { logEl.textContent = msg; }
 // Enumerate output devices
 async function enumerateOutputs() {
     try {
-        // Request permission first
-        await navigator.mediaDevices.getUserMedia({ audio: true });
         const devices = await navigator.mediaDevices.enumerateDevices();
         const outputs = devices.filter(d => d.kind === 'audiooutput');
         outputSelect.innerHTML = '<option value="">-- Default output --</option>';
@@ -259,6 +257,14 @@ async function enumerateOutputs() {
     } catch (e) { /* ignore */ }
 }
 enumerateOutputs();
+
+// Auto-detect device changes (USB plug/unplug, mode switch)
+if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+    navigator.mediaDevices.addEventListener('devicechange', () => {
+        console.log('[DEVICE] Audio device changed, re-enumerating...');
+        enumerateOutputs();
+    });
+}
 
 // Receive buffer for multi-frame image
 let rxImageBuf = new Uint8Array(512);
