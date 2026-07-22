@@ -357,9 +357,9 @@ btnSend.addEventListener('click', async () => {
     setLog(`Sending ${imgData.length} bytes...`);
     progressBar.style.width = '0%';
 
-    const CHUNK_SIZE = 120;
+    const CHUNK_SIZE = 60; // Smaller chunks = higher CRC pass rate
     const totalChunks = Math.ceil(imgData.length / CHUNK_SIZE);
-    const REDUNDANCY = 2; // Send each chunk twice for reliability
+    const REDUNDANCY = 1; // Single send with FEC
 
     for (let seq = 0; seq < totalChunks; seq++) {
         const offset = seq * CHUNK_SIZE;
