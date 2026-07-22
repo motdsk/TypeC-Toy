@@ -303,8 +303,11 @@ async function connect() {
             try {
                 const devices = await navigator.mediaDevices.enumerateDevices();
                 const inputs = devices.filter(d => d.kind === 'audioinput');
+                const outputs = devices.filter(d => d.kind === 'audiooutput');
+                console.log('[RX] Audio inputs:', inputs.map(d => `${d.label} [${d.deviceId.slice(0,8)}] group=${d.groupId.slice(0,8)}`));
+                console.log('[RX] Audio outputs:', outputs.map(d => `${d.label} [${d.deviceId.slice(0,8)}] group=${d.groupId.slice(0,8)}`));
                 // Look for USB UAC device by label match
-                const usbMic = inputs.find(d => d.label.toLowerCase().includes('usb') || d.label.includes('uac') || d.label.includes('303a'));
+                const usbMic = inputs.find(d => d.label.toLowerCase().includes('usb') || d.label.includes('uac') || d.label.includes('303a') || d.label.includes('ヘッドセット'));
                 if (usbMic) {
                     micDeviceId = usbMic.deviceId;
                     console.log('[RX] Using USB mic:', usbMic.label);
@@ -322,6 +325,11 @@ async function connect() {
                             }
                         }
                     }
+                    // Android fallback: if no USB mic found but only one input exists,
+                    // Android may have auto-routed USB headset as default
+                    if (!micDeviceId && inputs.length === 1) {
+                        console.log('[RX] Only one input available, using it (Android auto-route):', inputs[0].label);
+                    }
                 }
             } catch (enumErr) {
                 console.warn('[RX] Device enumeration failed:', enumErr);
@@ -337,7 +345,13 @@ async function connect() {
                     ...(micDeviceId ? { deviceId: { exact: micDeviceId } } : {})
                 }
             };
+            console.log('[RX] getUserMedia constraints:', JSON.stringify(constraints));
             mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+
+            // Log which track we actually got
+            const audioTrack = mediaStream.getAudioTracks()[0];
+            const trackSettings = audioTrack ? audioTrack.getSettings() : {};
+            console.log('[RX] Got audio track:', audioTrack?.label, 'settings:', JSON.stringify(trackSettings));
 
             await audioContext.audioWorklet.addModule('fsk-decoder-worklet.js');
             decoderNode = new AudioWorkletNode(audioContext, 'fsk-decoder-processor', { numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1 });
