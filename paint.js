@@ -306,6 +306,7 @@ async function connect() {
                 const outputs = devices.filter(d => d.kind === 'audiooutput');
                 console.log('[RX] Audio inputs:', inputs.map(d => `${d.label} [${d.deviceId.slice(0,8)}] group=${d.groupId.slice(0,8)}`));
                 console.log('[RX] Audio outputs:', outputs.map(d => `${d.label} [${d.deviceId.slice(0,8)}] group=${d.groupId.slice(0,8)}`));
+                setLog(`Inputs: ${inputs.length}, Outputs: ${outputs.length}`);
                 // Look for USB UAC device by label match
                 const usbMic = inputs.find(d => d.label.toLowerCase().includes('usb') || d.label.includes('uac') || d.label.includes('303a') || d.label.includes('ヘッドセット'));
                 if (usbMic) {
@@ -352,6 +353,7 @@ async function connect() {
             const audioTrack = mediaStream.getAudioTracks()[0];
             const trackSettings = audioTrack ? audioTrack.getSettings() : {};
             console.log('[RX] Got audio track:', audioTrack?.label, 'settings:', JSON.stringify(trackSettings));
+            setLog(`Mic: ${audioTrack?.label || 'unknown'} SR:${trackSettings.sampleRate || '?'}`);
 
             await audioContext.audioWorklet.addModule('fsk-decoder-worklet.js');
             decoderNode = new AudioWorkletNode(audioContext, 'fsk-decoder-processor', { numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1 });
@@ -478,7 +480,12 @@ function handleRx(data) {
         }
     } else if (data.type === 'crc_error') {
         console.warn('[RX] CRC FAIL: got=0x' + data.received.toString(16) + ' want=0x' + data.expected.toString(16) + ' len=' + data.payloadLen + ' first=' + JSON.stringify(data.firstBytes));
+        setLog(`CRC ERR len=${data.payloadLen}`);
     } else if (data.type === 'stats') {
         console.log('[DECODER] bits=' + data.bits + ' magMark=' + data.lastMark + ' magSpace=' + data.lastSpace);
+        // Show signal level on screen every 10000 bits
+        if (data.bits % 10000 === 0) {
+            setLog(`Signal: M=${data.lastMark} S=${data.lastSpace}`);
+        }
     }
 }
