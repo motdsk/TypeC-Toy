@@ -298,7 +298,45 @@ async function connect() {
 
         // Decoder (RX) - optional, may fail on mobile if USB mic not accessible
         try {
-            const constraints = { audio: { sampleRate: 48000, channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false } };
+            // Find the USB audio input device matching the selected output
+            let micDeviceId = undefined;
+            try {
+                const devices = await navigator.mediaDevices.enumerateDevices();
+                const inputs = devices.filter(d => d.kind === 'audioinput');
+                // Look for USB UAC device by label match
+                const usbMic = inputs.find(d => d.label.toLowerCase().includes('usb') || d.label.includes('uac') || d.label.includes('303a'));
+                if (usbMic) {
+                    micDeviceId = usbMic.deviceId;
+                    console.log('[RX] Using USB mic:', usbMic.label);
+                } else if (inputs.length > 0) {
+                    // If output was set to USB device, try to find matching input by groupId
+                    const selectedOutput = outputSelect.value;
+                    if (selectedOutput) {
+                        const allDevices = devices;
+                        const outDev = allDevices.find(d => d.deviceId === selectedOutput);
+                        if (outDev && outDev.groupId) {
+                            const matchedInput = inputs.find(d => d.groupId === outDev.groupId);
+                            if (matchedInput) {
+                                micDeviceId = matchedInput.deviceId;
+                                console.log('[RX] Matched input by groupId:', matchedInput.label);
+                            }
+                        }
+                    }
+                }
+            } catch (enumErr) {
+                console.warn('[RX] Device enumeration failed:', enumErr);
+            }
+
+            const constraints = {
+                audio: {
+                    sampleRate: 48000,
+                    channelCount: 1,
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: false,
+                    ...(micDeviceId ? { deviceId: { exact: micDeviceId } } : {})
+                }
+            };
             mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
 
             await audioContext.audioWorklet.addModule('fsk-decoder-worklet.js');
@@ -307,7 +345,7 @@ async function connect() {
 
             const source = audioContext.createMediaStreamSource(mediaStream);
             source.connect(decoderNode);
-            console.log('[RX] Decoder connected');
+            console.log('[RX] Decoder connected' + (micDeviceId ? ' (USB mic)' : ' (default mic)'));
         } catch (rxErr) {
             console.warn('[RX] Decoder setup failed (send-only mode):', rxErr.message);
         }
@@ -400,18 +438,18 @@ function handleRx(data) {
             const isRLE = payload[0] === IMG_RLE_CMD;
             const seq = payload[1];
             const chunk = payload.slice(2);
-            // ESP32 sends with 253-byte chunks, browser sends with 120-byte chunks
-            // Detect by chunk size: if >120, it's from ESP32 (253-byte chunks)
-            const chunkMaxSize = chunk.length > 120 ? 253 : 120;
-            const offset = seq * chunkMaxSize;
+            // CoreS3 sends with max 253-byte chunks (payload max 255 - 2 header bytes)
+            // Use fixed chunk size for offset calculation
+            const CHUNK_MAX = 253;
+            const offset = seq * CHUNK_MAX;
             if (offset + chunk.length <= 512) {
                 rxImageBuf.set(chunk, offset);
                 rxImageChunks |= (1 << seq);
                 rxImageLen = Math.max(rxImageLen, offset + chunk.length);
             }
 
-            // Complete if this chunk is shorter than max
-            if (chunk.length < chunkMaxSize) {
+            // Complete if this chunk is shorter than max (last chunk)
+            if (chunk.length < CHUNK_MAX) {
                 const imgBytes = rxImageBuf.slice(0, rxImageLen);
                 const imgPixels = isRLE ? decodeImageRLE(imgBytes) : decodeImage(imgBytes);
                 renderRecvCanvas(imgPixels);
