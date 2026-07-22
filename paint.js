@@ -359,7 +359,7 @@ btnSend.addEventListener('click', async () => {
 
     const CHUNK_SIZE = 120;
     const totalChunks = Math.ceil(imgData.length / CHUNK_SIZE);
-    const REDUNDANCY = 1; // Single send (reliable now that frequency mapping is fixed)
+    const REDUNDANCY = 2; // Send each chunk twice for reliability
 
     for (let seq = 0; seq < totalChunks; seq++) {
         const offset = seq * CHUNK_SIZE;
