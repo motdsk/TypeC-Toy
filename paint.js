@@ -298,6 +298,11 @@ async function connect() {
 
         // Decoder (RX) - optional, may fail on mobile if USB mic not accessible
         try {
+            // First, get permission (this triggers Android to show USB device in subsequent calls)
+            const tempStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            tempStream.getTracks().forEach(t => t.stop());
+            // Small delay to let Android audio routing settle after permission grant
+            await new Promise(r => setTimeout(r, 300));
             // Find the USB audio input device matching the selected output
             let micDeviceId = undefined;
             try {
@@ -352,8 +357,11 @@ async function connect() {
             // Log which track we actually got
             const audioTrack = mediaStream.getAudioTracks()[0];
             const trackSettings = audioTrack ? audioTrack.getSettings() : {};
-            console.log('[RX] Got audio track:', audioTrack?.label, 'settings:', JSON.stringify(trackSettings));
-            setLog(`Mic: ${audioTrack?.label || 'unknown'} SR:${trackSettings.sampleRate || '?'}`);
+            const micLabel = audioTrack?.label || 'unknown';
+            console.log('[RX] Got audio track:', micLabel, 'settings:', JSON.stringify(trackSettings));
+            setLog(`🎤 ${micLabel}`);
+            // Store mic label for persistent display
+            window._micLabel = micLabel;
 
             await audioContext.audioWorklet.addModule('fsk-decoder-worklet.js');
             decoderNode = new AudioWorkletNode(audioContext, 'fsk-decoder-processor', { numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1 });
@@ -485,7 +493,8 @@ function handleRx(data) {
         console.log('[DECODER] bits=' + data.bits + ' magMark=' + data.lastMark + ' magSpace=' + data.lastSpace);
         // Show signal level on screen every 10000 bits
         if (data.bits % 10000 === 0) {
-            setLog(`Signal: M=${data.lastMark} S=${data.lastSpace}`);
+            const mic = window._micLabel || '?';
+            setLog(`🎤${mic.slice(0,20)} | M=${data.lastMark} S=${data.lastSpace}`);
         }
     }
 }
