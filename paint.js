@@ -232,6 +232,40 @@ let decoderNode = null;
 let mediaStream = null;
 let isConnected = false;
 
+// ---- Transport selection & sample-corruption fallback (要件18-8) ----
+// PCM直接搬送をデフォルトとし、サンプル改変環境ではFSKへ一方向フォールバックする。
+let currentTransport = 'pcm';       // 'pcm' (default) or 'fsk' (fallback)
+let fallbackDone = false;           // pcm->fsk フォールバックは connect() ごとに一度だけ
+let switchingTransport = false;     // 切替中のガード（ping-pong防止）
+let pcmCrcErrorStreak = 0;          // 連続CRC失敗数（有効フレーム受信でリセット）
+let pcmStatsWindows = 0;            // PCM statsを受信した回数（≒経過秒数）
+let pcmFramesSeen = 0;              // これまでに受信できた有効フレーム総数
+
+// フォールバック閾値
+const FALLBACK_CRC_STREAK = 8;      // CRCが連続8回失敗 → PCM不可とみなす
+const FALLBACK_SILENT_WINDOWS = 2;  // 有効フレーム0のstats窓が2回(≒2秒) → Sync不成立とみなす
+
+const TRANSPORT_MODULES = {
+    pcm: {
+        encoderModule: 'pcm-encoder-worklet.js',
+        encoderNode: 'pcm-encoder-processor',
+        decoderModule: 'pcm-decoder-worklet.js',
+        decoderNode: 'pcm-decoder-processor',
+    },
+    fsk: {
+        encoderModule: 'fsk-encoder-worklet.js',
+        encoderNode: 'fsk-encoder-processor',
+        decoderModule: 'fsk-decoder-worklet.js',
+        decoderNode: 'fsk-decoder-processor',
+    },
+};
+
+function resetFallbackCounters() {
+    pcmCrcErrorStreak = 0;
+    pcmStatsWindows = 0;
+    pcmFramesSeen = 0;
+}
+
 const statusDot = document.getElementById('statusDot');
 const statusText = document.getElementById('statusText');
 const btnConnect = document.getElementById('btnConnect');
@@ -271,20 +305,42 @@ let rxImageBuf = new Uint8Array(512);
 let rxImageChunks = 0; // bitmask
 let rxImageLen = 0;
 
+// エンコーダ/デコードのworklet読み込み・ノード生成・配線をトランスポート依存で行う。
+// mediaStream / audioContext は呼び出し側で維持し、この関数では作り直さない。
+async function setupTransport(transport) {
+    const cfg = TRANSPORT_MODULES[transport] || TRANSPORT_MODULES.pcm;
+
+    // Encoder (TX)
+    await audioContext.audioWorklet.addModule(cfg.encoderModule);
+    encoderNode = new AudioWorkletNode(audioContext, cfg.encoderNode, { outputChannelCount: [1] });
+    encoderNode.port.onmessage = (e) => {
+        if (e.data.type === 'tx_start') console.log('[ENC] TX queued, qLen=' + e.data.queueLen + ' fLen=' + e.data.frameLen);
+        else if (e.data.type === 'tx_done') console.log('[ENC] TX done');
+    };
+    encoderNode.connect(audioContext.destination);
+
+    // Decoder (RX) - requires an existing mediaStream source
+    if (mediaStream) {
+        await audioContext.audioWorklet.addModule(cfg.decoderModule);
+        decoderNode = new AudioWorkletNode(audioContext, cfg.decoderNode, { numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1 });
+        decoderNode.port.onmessage = (e) => handleRx(e.data);
+        const source = audioContext.createMediaStreamSource(mediaStream);
+        source.connect(decoderNode);
+        console.log('[RX] Decoder connected (' + transport + ')');
+    }
+}
+
 async function connect() {
     if (isConnected) { disconnect(); return; }
     try {
         audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
         if (audioContext.state === 'suspended') await audioContext.resume();
 
-        // Encoder (TX) - always set up
-        await audioContext.audioWorklet.addModule('fsk-encoder-worklet.js');
-        encoderNode = new AudioWorkletNode(audioContext, 'fsk-encoder-processor', { outputChannelCount: [1] });
-        encoderNode.port.onmessage = (e) => {
-            if (e.data.type === 'tx_start') console.log('[ENC] TX queued, qLen=' + e.data.queueLen + ' fLen=' + e.data.frameLen);
-            else if (e.data.type === 'tx_done') console.log('[ENC] TX done');
-        };
-        encoderNode.connect(audioContext.destination);
+        // Fresh connect: default to PCM direct transport, reset fallback state.
+        currentTransport = 'pcm';
+        fallbackDone = false;
+        switchingTransport = false;
+        resetFallbackCounters();
 
         // Set audio output to selected device
         const selectedOutput = outputSelect.value;
@@ -362,17 +418,15 @@ async function connect() {
             setLog(`🎤 ${micLabel}`);
             // Store mic label for persistent display
             window._micLabel = micLabel;
-
-            await audioContext.audioWorklet.addModule('fsk-decoder-worklet.js');
-            decoderNode = new AudioWorkletNode(audioContext, 'fsk-decoder-processor', { numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1 });
-            decoderNode.port.onmessage = (e) => handleRx(e.data);
-
-            const source = audioContext.createMediaStreamSource(mediaStream);
-            source.connect(decoderNode);
-            console.log('[RX] Decoder connected' + (micDeviceId ? ' (USB mic)' : ' (default mic)'));
+            console.log('[RX] Mic acquired' + (micDeviceId ? ' (USB mic)' : ' (default mic)'));
         } catch (rxErr) {
-            console.warn('[RX] Decoder setup failed (send-only mode):', rxErr.message);
+            console.warn('[RX] Mic acquisition failed (send-only mode):', rxErr.message);
+            mediaStream = null;
         }
+
+        // Load worklets & wire encoder/decoder for the current transport (default: PCM).
+        // setupTransport connects the decoder only when a mediaStream is available.
+        await setupTransport(currentTransport);
 
         isConnected = true;
         statusDot.classList.add('connected');
@@ -380,11 +434,43 @@ async function connect() {
         btnConnect.textContent = '🔌 Disconnect';
         btnConnect.classList.add('connected');
         btnSend.disabled = false;
-        setLog('Audio connected');
+        setLog('Audio connected (' + currentTransport.toUpperCase() + ')');
     } catch (err) {
         setLog('Error: ' + err.message);
         disconnect();
     }
+}
+
+// PCM -> FSK 一方向フォールバック（要件18-8）。
+// mediaStream / audioContext は維持したまま、worklet ノードだけを張り替える。
+async function switchTransport(transport) {
+    if (switchingTransport) return;
+    switchingTransport = true;
+    try {
+        // Tear down current worklet nodes (keep mediaStream + audioContext alive).
+        if (encoderNode) { encoderNode.disconnect(); encoderNode = null; }
+        if (decoderNode) { decoderNode.disconnect(); decoderNode = null; }
+
+        currentTransport = transport;
+        resetFallbackCounters();
+
+        await setupTransport(transport);
+        console.warn('[FALLBACK] Transport switched to ' + transport.toUpperCase());
+        setLog('通信方式を ' + transport.toUpperCase() + ' に切替しました');
+    } catch (e) {
+        console.error('[FALLBACK] switchTransport failed:', e);
+    } finally {
+        switchingTransport = false;
+    }
+}
+
+// PCM統計/CRC状況からサンプル改変環境を判定し、必要ならFSKへフォールバックする。
+function maybeFallbackToFsk(reason) {
+    if (currentTransport !== 'pcm' || fallbackDone || switchingTransport) return;
+    fallbackDone = true; // 一度だけ（ping-pong防止）
+    console.warn('[FALLBACK] PCM通信不可と判定 (' + reason + ') → FSKへフォールバック');
+    setLog('PCM通信不可 → FSKにフォールバック (' + reason + ')');
+    switchTransport('fsk');
 }
 
 function disconnect() {
@@ -392,6 +478,11 @@ function disconnect() {
     if (decoderNode) { decoderNode.disconnect(); decoderNode = null; }
     if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
     if (audioContext) { audioContext.close(); audioContext = null; }
+    // Reset transport/fallback state so the next connect() starts fresh on PCM.
+    currentTransport = 'pcm';
+    fallbackDone = false;
+    switchingTransport = false;
+    resetFallbackCounters();
     isConnected = false;
     statusDot.classList.remove('connected');
     statusText.textContent = 'Disconnected';
@@ -454,6 +545,9 @@ btnSend.addEventListener('click', async () => {
 
 function handleRx(data) {
     if (data.type === 'frame') {
+        // Valid frame proves PCM (or FSK) is viable → reset the CRC-failure streak.
+        pcmCrcErrorStreak = 0;
+        pcmFramesSeen++;
         const payload = data.payload;
         console.log('[RX] Frame OK, len=' + payload.length + ', hex=' + Array.from(payload.slice(0, 8)).map(b => b.toString(16).padStart(2,'0')).join(' '));
 
@@ -489,12 +583,41 @@ function handleRx(data) {
     } else if (data.type === 'crc_error') {
         console.warn('[RX] CRC FAIL: got=0x' + data.received.toString(16) + ' want=0x' + data.expected.toString(16) + ' len=' + data.payloadLen + ' first=' + JSON.stringify(data.firstBytes));
         setLog(`CRC ERR len=${data.payloadLen}`);
+        // Sample-corruption detection (要件18-8): Sync is detected (we reached CRC)
+        // but the payload bytes are being mangled → consecutive CRC failures.
+        if (currentTransport === 'pcm') {
+            pcmCrcErrorStreak++;
+            if (pcmCrcErrorStreak >= FALLBACK_CRC_STREAK) {
+                maybeFallbackToFsk('CRC連続失敗×' + pcmCrcErrorStreak);
+            }
+        }
     } else if (data.type === 'stats') {
-        console.log('[DECODER] bits=' + data.bits + ' magMark=' + data.lastMark + ' magSpace=' + data.lastSpace);
-        // Show signal level on screen every 10000 bits
-        if (data.bits % 10000 === 0) {
+        // Stats shape differs by transport:
+        //   PCM: { samples, frames, crcErrors }
+        //   FSK: { bits, lastMark, lastSpace }
+        const isPcmStats = (data.samples !== undefined);
+        if (isPcmStats) {
+            console.log('[DECODER] PCM samples=' + data.samples + ' frames=' + data.frames + ' crcErrors=' + data.crcErrors);
             const mic = window._micLabel || '?';
-            setLog(`🎤${mic.slice(0,20)} | M=${data.lastMark} S=${data.lastSpace}`);
+            setLog(`🎤${mic.slice(0,20)} | frames=${data.frames} crcErr=${data.crcErrors}`);
+
+            // Sample-corruption detection (要件18-8): audio is clearly flowing
+            // (samples growing) but no valid frame AND no CRC error at all means
+            // the Sync pattern is never even detected → sample values corrupted.
+            if (currentTransport === 'pcm') {
+                pcmStatsWindows++;
+                if (pcmStatsWindows >= FALLBACK_SILENT_WINDOWS &&
+                    data.samples > 0 && data.frames === 0 && data.crcErrors === 0) {
+                    maybeFallbackToFsk('Sync未検出 (' + pcmStatsWindows + '窓, samples=' + data.samples + ')');
+                }
+            }
+        } else {
+            console.log('[DECODER] FSK bits=' + data.bits + ' magMark=' + data.lastMark + ' magSpace=' + data.lastSpace);
+            // Show signal level on screen every 10000 bits
+            if (data.bits % 10000 === 0) {
+                const mic = window._micLabel || '?';
+                setLog(`🎤${mic.slice(0,20)} | M=${data.lastMark} S=${data.lastSpace}`);
+            }
         }
     }
 }
