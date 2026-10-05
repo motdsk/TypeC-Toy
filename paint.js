@@ -556,9 +556,9 @@ function handleRx(data) {
             const isRLE = payload[0] === IMG_RLE_CMD;
             const seq = payload[1];
             const chunk = payload.slice(2);
-            // CoreS3 sends with max 253-byte chunks (payload max 255 - 2 header bytes)
-            // Use fixed chunk size for offset calculation
-            const CHUNK_MAX = 253;
+            // CoreS3 sends with 60-byte chunks (frame total 62B <= PCM_MAX_FRAME_PAYLOAD=64).
+            // 対策Y に合わせて送信チャンクを 60B に下げたので、offset 計算もそれに合わせる。
+            const CHUNK_MAX = 60;
             const offset = seq * CHUNK_MAX;
             if (offset + chunk.length <= 512) {
                 rxImageBuf.set(chunk, offset);

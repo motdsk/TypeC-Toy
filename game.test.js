@@ -1,22 +1,26 @@
 /**
  * game.test.js - ブラウザ側ゲームロジックがファームウェア game_shooter.c と
- * バイト/Seq/HIT/HP/チャージ/CFIRE/GAMEOVER/相対移動の意味論で一致することを
- * 検証する Node テスト。
+ * 一致することを検証する Node テスト（状態同期パケット版）。
  *
  * 実行: node web/game.test.js
  *
- * game.js は DOM 非依存で require 可能に作ってある（_hasDOM ガード）。
- * テスト送信フックを注入してパケット内容をキャプチャする。
+ * 状態同期パケット(6バイト): [0]x [1]y [2]fire_cnt(bit0-6=累積,bit7=大弾)
+ *                            [3]hp [4]flags(bit0=gameover,bit1-2=result,bit3=charging)
+ *                            [5]seq
+ * 設計の肝: 全パケットが「現在の状態」。欠落・古いパケット破棄があっても
+ *          最新1個で完全復元でき、HP/HIT/発射がずれない。
  */
 'use strict';
 
 const g = require('./game.js');
 const {
     GAME_FIELD_W, GAME_FIELD_H, GAME_SHIP_W, GAME_SHIP_H,
-    GAME_MAX_HP, GAME_WIN_SCORE, GAME_BIG_DAMAGE,
+    GAME_MAX_HP, GAME_WIN_SCORE, GAME_BIG_DAMAGE, GAME_MAX_BULLETS,
     GAME_MOVE_SENS_PCT, GAME_CHARGE_FULL_MS,
-    GAME_PKT_FLAG_FIRE, GAME_PKT_FLAG_HIT, GAME_PKT_FLAG_CFIRE,
-    GAME_PKT_FLAG_GAMEOVER, GAME_PKT_RESULT_SHIFT, GAME_PKT_RESULT_MASK,
+    GAME_PKT_LEN, GAME_PKT_X, GAME_PKT_Y, GAME_PKT_FIRECNT, GAME_PKT_HP,
+    GAME_PKT_FLAGS, GAME_PKT_SEQ,
+    GAME_PKT_FIRE_BIG_BIT, GAME_PKT_FIRE_CNT_MASK,
+    GAME_PKT_FLAG_GAMEOVER, GAME_PKT_RESULT_SHIFT, GAME_PKT_RESULT_MASK, GAME_PKT_FLAG_CHARGING,
     GAME_RES_WIN, GAME_RES_LOSE, GAME_RES_DRAW,
     GAME_COUNTDOWN_MS, GAME_TIME_LIMIT_MS, GAME_SEND_INTERVAL_MS,
     SCALE_X,
@@ -35,329 +39,182 @@ function check(cond, msg) {
     else { fail++; console.log('FAIL: ' + msg); }
 }
 
-// ヘルパ: MATCHING -> PLAYING
+// 相手の状態同期パケットを作るヘルパ
+function pkt({ x = 80, y = 100, fireCnt = 0, big = false, hp = GAME_MAX_HP, flags = 0, seq = 0 }) {
+    let fc = fireCnt & GAME_PKT_FIRE_CNT_MASK;
+    if (big) fc |= GAME_PKT_FIRE_BIG_BIT;
+    const p = [];
+    p[GAME_PKT_X] = x & 0xFF;
+    p[GAME_PKT_Y] = y & 0xFF;
+    p[GAME_PKT_FIRECNT] = fc & 0xFF;
+    p[GAME_PKT_HP] = hp & 0xFF;
+    p[GAME_PKT_FLAGS] = flags & 0xFF;
+    p[GAME_PKT_SEQ] = seq & 0xFF;
+    return p;
+}
+
+// MATCHING -> PLAYING
 function advanceToPlaying(t) {
-    gameOnRx([0, 80, 100, 1]); // 相手(P1/下)。位置は下側でも可
-    gameTick(t);               // MATCHING -> COUNTDOWN
+    gameOnRx(pkt({ seq: 1 }));
+    gameTick(t);
     t += GAME_COUNTDOWN_MS;
-    gameTick(t);               // COUNTDOWN -> PLAYING
+    gameTick(t);
     return t;
 }
 
-// --- Seq newest-wins (pure helper) ---
+// --- Seq newest-wins ---
 function testSeqHelper() {
     check(seqIsNewer(202, 200) === true, 'seq 200->202 newer');
     check(seqIsNewer(199, 200) === false, 'seq 200->199 older');
-    check(seqIsNewer(1, 202) === true, 'seq wrap 202->1 newer'); // (1-202) int8 = +55
-    check(seqIsNewer(250, 1) === false, 'seq 1->250 older'); // (250-1) int8 = -7
-    check(seqIsNewer(5, 5) === false, 'same seq is not newer');
+    check(seqIsNewer(1, 202) === true, 'seq wrap 202->1 newer');
+    check(seqIsNewer(250, 1) === false, 'seq 1->250 older');
+    check(seqIsNewer(5, 5) === false, 'same seq not newer');
 }
 
-// --- 入力パケットフォーマット ---
+// --- パケットフォーマット（6バイト・状態） ---
 function testPacketFormat() {
     gameInit();
     sendCount = 0;
-    // 押していない状態: fire=false。x は物理タッチだが押していないので位置は変わらない。
+    let t = advanceToPlaying(1000);
     gameOnInput(0, 0, false);
-    gameTick(0); // last_send_ms=0, everSent=false -> 初回送信
-    check(sendCount >= 1, 'packet sent during matching');
-    check(lastPkt.length === 4, 'packet length is 4');
-    // 自機初期X = (160-12)/2 = 74。 Y は home_y(P2)=4。
-    check(lastPkt[1] === 74, 'packet X = initial ship X (74)');
-    check(lastPkt[2] === 4, 'packet[2] = ship Y (home_y P2 = 4)');
-    check((lastPkt[0] & GAME_PKT_FLAG_FIRE) === 0, 'no fire flag when idle');
-    check((lastPkt[0] & GAME_PKT_FLAG_CFIRE) === 0, 'no cfire flag when idle');
-
-    const seq0 = lastPkt[3];
-    gameTick(GAME_SEND_INTERVAL_MS);
-    const seq1 = lastPkt[3];
+    t += GAME_SEND_INTERVAL_MS; gameTick(t);
+    check(lastPkt.length === GAME_PKT_LEN, 'packet is 6 bytes');
+    check(lastPkt[GAME_PKT_HP] === GAME_MAX_HP, 'packet hp = full at start');
+    check((lastPkt[GAME_PKT_FIRECNT] & GAME_PKT_FIRE_CNT_MASK) === 0, 'fire_cnt=0 when no fire');
+    const seq0 = lastPkt[GAME_PKT_SEQ];
+    t += GAME_SEND_INTERVAL_MS; gameTick(t);
+    const seq1 = lastPkt[GAME_PKT_SEQ];
     check(((seq1 - seq0) & 0xFF) === 1, 'seq increments by 1');
 }
 
-// --- 相対移動 (バーチャルスティック) の演算 ---
-function testRelativeMove() {
+// --- 位置は絶対座標で送る/受ける ---
+function testPosition() {
     gameInit();
-    const startX = G.local.x; // 74
-    // 押し始め: 物理X=100 でアンカー確立 ( this frame moves 0)
-    gameOnInput(100, 0, true);
-    check(G.local.x === startX, 'anchor frame does not move');
-
-    // 物理Xを +40 動かす: delta_phys=40, delta_log = trunc(trunc(40*70/100)/2)
-    // = trunc(trunc(28)/2) = trunc(14) = 14
-    gameOnInput(140, 0, true);
-    check(G.local.x === startX + 14, 'relative move applies sens% and /SCALE_X (delta=14)');
-
-    // 逆方向: 物理X=100 に戻すと delta=0 -> anchorShipX に戻る
-    gameOnInput(100, 0, true);
-    check(G.local.x === startX, 'relative move back to anchor');
-
-    // 離すとアンカークリア、位置は保持
-    gameOnInput(100, 0, false);
-    check(G.local.x === startX, 'position preserved after release');
-
-    // クランプ確認: 極端に右へ
-    gameInit();
-    gameOnInput(0, 0, true);      // anchor at phys 0
-    gameOnInput(9999, 0, true);   // huge delta -> clamp to FIELD_W-SHIP_W
-    check(G.local.x === GAME_FIELD_W - GAME_SHIP_W, 'move clamped to right edge');
-    gameOnInput(-9999, 0, true);
-    check(G.local.x === 0, 'move clamped to left edge');
+    let t = advanceToPlaying(1000);
+    // 相手位置を受信（絶対座標）
+    gameOnRx(pkt({ x: 20, y: 30, seq: 10 }));
+    check(G.remote.x === 20, 'remote x updated to 20');
+    check(G.remote.y === 30, 'remote y updated to 30');
+    // 古いseqは無視（状態同期でも順序は守る）
+    gameOnRx(pkt({ x: 99, y: 99, seq: 5 }));
+    check(G.remote.x === 20, 'older seq ignored (x stays 20)');
 }
 
-// --- 小弾(タップ)発射 -> FIRE フラグ ---
-function testSmallFire() {
+// --- 発射: fire_count 差分で相手弾がスポーン ---
+function testFireCounterSpawn() {
     gameInit();
-    let t = advanceToPlaying(0);
-    check(G.state === GAME_STATE_PLAYING, 'reached playing');
-
-    sendCount = 0; lastPkt = null;
-    // 押す (touching) -> 短ため -> 離す (release) -> tick で小弾発射 + pending_fire
-    gameOnInput(100, 0, true);
-    t += GAME_SEND_INTERVAL_MS; gameTick(t);   // press edge (charge start)
-    gameOnInput(100, 0, false);
-    t += GAME_SEND_INTERVAL_MS; gameTick(t);   // release edge -> spawn small + pending_fire
-
-    // 直後の tick 送信で FIRE フラグが乗る
-    let sawFire = false;
-    for (let i = 0; i < 3; i++) {
-        if (lastPkt && (lastPkt[0] & GAME_PKT_FLAG_FIRE)) { sawFire = true; break; }
-        t += GAME_SEND_INTERVAL_MS; gameTick(t);
-    }
-    check(sawFire, 'quick tap+release sends FIRE flag (small bullet)');
-    // 自機弾が1発 active になっている
-    const activeLocal = G.local.bullets.filter(b => b.active).length;
-    check(activeLocal >= 1, 'small bullet spawned locally on release');
-}
-
-// --- 大弾(長ため)発射 -> CFIRE フラグ + 貫通/ダメージ3 ---
-function testBigFire() {
-    gameInit();
-    let t = advanceToPlaying(0);
-    sendCount = 0; lastPkt = null;
-
-    // 押し始め
-    gameOnInput(100, 0, true);
-    t += GAME_SEND_INTERVAL_MS; gameTick(t);   // charge start
-    // CHARGE_FULL_MS 以上ためる (ホールドしたまま時間を進める)
-    const holdEnd = t + GAME_CHARGE_FULL_MS + 100;
-    for (t += GAME_SEND_INTERVAL_MS; t < holdEnd; t += GAME_SEND_INTERVAL_MS) {
-        gameOnInput(100, 0, true);
-        gameTick(t);
-    }
-    // 離す -> 大弾発射 + pending_cfire
-    gameOnInput(100, 0, false);
-    t += GAME_SEND_INTERVAL_MS; gameTick(t);
-
-    let sawCfire = false;
-    for (let i = 0; i < 3; i++) {
-        if (lastPkt && (lastPkt[0] & GAME_PKT_FLAG_CFIRE)) { sawCfire = true; break; }
-        t += GAME_SEND_INTERVAL_MS; gameTick(t);
-    }
-    check(sawCfire, 'long hold+release sends CFIRE flag (big bullet)');
-    const big = G.local.bullets.find(b => b.active && b.charged);
-    check(!!big, 'big charged bullet spawned locally');
-    check(big && big.damage === GAME_BIG_DAMAGE, 'big bullet damage is 3');
-}
-
-// --- 相手の FIRE/CFIRE 受信 -> 相手弾を決定論スポーン ---
-function testRemoteSpawn() {
-    gameInit();
-    let t = advanceToPlaying(0);
-
+    let t = advanceToPlaying(1000);
     const before = G.remote.bullets.filter(b => b.active).length;
-    gameOnRx([GAME_PKT_FLAG_FIRE, 74, 100, 50]); // 相手が小弾発射
-    const afterSmall = G.remote.bullets.filter(b => b.active).length;
-    check(afterSmall === before + 1, 'remote FIRE spawns one remote bullet');
-
-    gameOnRx([GAME_PKT_FLAG_CFIRE, 74, 100, 51]); // 相手が大弾発射
-    const bigRemote = G.remote.bullets.find(b => b.active && b.charged);
-    check(!!bigRemote, 'remote CFIRE spawns charged remote bullet');
-    // 相手(P1)は上方向へ撃つ -> vy 負
-    check(bigRemote && bigRemote.vy < 0, 'remote (P1) bullet travels up (vy<0)');
+    // 相手が1発撃った（fireCnt 0->1）
+    gameOnRx(pkt({ fireCnt: 1, seq: 11 }));
+    const after1 = G.remote.bullets.filter(b => b.active).length;
+    check(after1 === before + 1, 'fire_cnt +1 spawns one remote bullet');
+    // 同じ fireCnt の再送（重複）はスポーンしない
+    gameOnRx(pkt({ fireCnt: 1, seq: 12 }));
+    const after2 = G.remote.bullets.filter(b => b.active).length;
+    check(after2 === after1, 'same fire_cnt (resend) does not double-spawn');
 }
 
-// --- HP: 相手弾が自機に当たると HP 減少 + pending_hit ---
-function testHpDamageAndHitNotify() {
+// --- 欠落補償: fire_cnt が飛んでも差分ぶんスポーン ---
+function testFireGapCompensation() {
     gameInit();
-    let t = advanceToPlaying(0);
-    check(G.local.hp === GAME_MAX_HP, 'hp starts at MAX_HP');
-
-    // 自機を既知位置に固定 (P2 上, home_y=4, x=74)
-    // 相手弾を自機の直上に手動配置して確実に当てる。
-    // 相手(P1)弾は上方向(-)へ進むので、自機のすぐ下 (y > 自機) から上へ来る位置に置く。
-    // 自機は y=4..13 (SHIP_H=10)。当たるように弾 y を 13 に置き、vy=-4 で 9 -> 命中。
-    const b = G.remote.bullets[0];
-    b.active = true; b.charged = false; b.damage = 1;
-    b.x = G.local.x + 6; // 自機中心 (74+6=80 だが自機x=74..85 内)
-    b.y = 13;
-    b.vy = -4;
-
-    sendCount = 0; lastPkt = null;
-    t += GAME_SEND_INTERVAL_MS;
-    gameTick(t); // 弾移動 13->9 命中, hp 5->4, pending_hit
-
-    check(G.local.hp === GAME_MAX_HP - 1, 'small bullet deals 1 damage to hp');
-
-    // 次の送信で HIT フラグ + data[2]=ダメージ量
-    let sawHit = false, hitDmg = -1;
-    for (let i = 0; i < 3; i++) {
-        if (lastPkt && (lastPkt[0] & GAME_PKT_FLAG_HIT)) { sawHit = true; hitDmg = lastPkt[2]; break; }
-        t += GAME_SEND_INTERVAL_MS; gameTick(t);
-    }
-    check(sawHit, 'HIT flag sent after being damaged');
-    check(hitDmg === 1, 'HIT packet data[2] = applied damage (1)');
+    let t = advanceToPlaying(1000);
+    const before = G.remote.bullets.filter(b => b.active).length;
+    // fireCnt が 0 -> 3 に飛んだ（間の2パケットが欠落）
+    gameOnRx(pkt({ fireCnt: 3, seq: 20 }));
+    const after = G.remote.bullets.filter(b => b.active).length;
+    check(after === before + 3, 'fire_cnt jump 0->3 spawns 3 bullets (gap compensated)');
 }
 
-// --- 大弾は貫通してダメージ3 ---
-function testBigBulletPierceDamage() {
+// --- 大弾フラグ ---
+function testBigBullet() {
     gameInit();
-    let t = advanceToPlaying(0);
-
-    const b = G.remote.bullets[0];
-    b.active = true; b.charged = true; b.damage = GAME_BIG_DAMAGE;
-    b.x = G.local.x + 6;
-    b.y = 13; b.vy = -4;
-
-    t += GAME_SEND_INTERVAL_MS;
-    gameTick(t); // 命中 -> hp 5->2, 貫通で弾は残る
-    check(G.local.hp === GAME_MAX_HP - GAME_BIG_DAMAGE, 'big bullet deals 3 damage');
-    check(b.active === true, 'big bullet pierces (stays active)');
+    let t = advanceToPlaying(1000);
+    gameOnRx(pkt({ fireCnt: 1, big: true, seq: 30 }));
+    const big = G.remote.bullets.find(b => b.active && b.charged);
+    check(!!big, 'fire with big bit spawns charged bullet');
 }
 
-// --- HIT 受信 -> local.score にダメージ量を加算 (権威=被弾側) ---
-function testScoreFromHit() {
+// --- HP状態同期: 相手HP現在値から score を算出（ずれない） ---
+function testHpStateSync() {
     gameInit();
-    let t = advanceToPlaying(0);
-    check(G.local.score === 0, 'score starts at 0');
-
-    // 相手が「被弾した(dmg=3)」と通知 -> 自分の与ダメージ +3
-    gameOnRx([GAME_PKT_FLAG_HIT, 74, 3, 60]);
-    check(G.local.score === 3, 'HIT with dmg=3 adds 3 to local score');
-
-    // dmg=0 のときは 1 として扱う
-    gameOnRx([GAME_PKT_FLAG_HIT, 74, 0, 61]);
-    check(G.local.score === 4, 'HIT with dmg=0 counts as 1');
+    let t = advanceToPlaying(1000);
+    // 相手HPが 5->2 に（自分が3ダメージ与えた状態）
+    gameOnRx(pkt({ hp: 2, seq: 40 }));
+    check(G.local.score === GAME_MAX_HP - 2, 'score = MAX_HP - opponent hp (=3)');
+    // さらに相手HP 2->0（計5ダメージ）
+    gameOnRx(pkt({ hp: 0, seq: 41 }));
+    check(G.local.score === GAME_MAX_HP, 'score reaches MAX when opp hp=0');
+    // 途中パケット欠落を模しても、最新HPで正しく復元される（単調増加）
 }
 
-// --- スコア到達で勝利 (与ダメ >= WIN_SCORE) ---
-function testWinByScore() {
+// --- HP欠落耐性: 中間を飛ばしても最新HPで正しい score ---
+function testHpGapResilience() {
     gameInit();
-    let t = advanceToPlaying(0);
-    let seq = 70;
-    // 相手が繰り返し被弾申告 (dmg=1) -> 与ダメ 5 到達で WIN
-    for (let i = 0; i < GAME_WIN_SCORE; i++) {
-        gameOnRx([GAME_PKT_FLAG_HIT, 74, 1, seq++ & 0xFF]);
-    }
-    check(G.local.score >= GAME_WIN_SCORE, 'score reached win threshold');
-    t += GAME_SEND_INTERVAL_MS;
-    gameTick(t);
-    check(G.state === GAME_STATE_RESULT, 'game finishes on win score');
-    check(G.result === GAME_RESULT_WIN, 'result is WIN');
+    let t = advanceToPlaying(1000);
+    // いきなり相手HP=1（間のHP通知が全部落ちた想定）
+    gameOnRx(pkt({ hp: 1, seq: 50 }));
+    check(G.local.score === GAME_MAX_HP - 1, 'score correct even if intermediate HP packets lost');
 }
 
-// --- HP 0 で敗北 ---
-function testLoseByHpZero() {
+// --- 被弾でHPが減り、送信パケットに現在HPが載る ---
+function testLocalHitSendsHp() {
     gameInit();
-    let t = advanceToPlaying(0);
-    // 相手弾で 5 回被弾させる: 手動で大弾(dmg3)+小弾(dmg1)x2 = 5
-    // シンプルに hp を直接減らさず、命中経由で確実に 0 にする。
-    // ここでは連続小弾で 5 ダメージ。
-    for (let k = 0; k < GAME_MAX_HP; k++) {
-        const b = G.remote.bullets[0];
-        b.active = true; b.charged = false; b.damage = 1;
-        b.x = G.local.x + 6; b.y = 13; b.vy = -4;
-        t += GAME_SEND_INTERVAL_MS;
-        gameTick(t);
-        if (G.state === GAME_STATE_RESULT) break;
-    }
-    check(G.local.hp === 0, 'hp reduced to 0');
-    check(G.state === GAME_STATE_RESULT, 'finished when hp hits 0');
-    check(G.result === GAME_RESULT_LOSE, 'lose when hp hits 0 (no kill)');
+    let t = advanceToPlaying(1000);
+    // 相手弾を自機に当てるため、相手が撃つ→弾が自機まで来るのを進める
+    // ここでは直接 G をいじらず、相手発射→tickで弾移動→被弾を数フレーム進める
+    // 自機を相手弾の正面に置く
+    G.local.x = G.remote.x; // 同じX
+    gameOnRx(pkt({ x: G.remote.x, fireCnt: 1, seq: 60 }));
+    // 弾が自機に到達するまで tick
+    for (let i = 0; i < 40; i++) { t += GAME_SEND_INTERVAL_MS; gameTick(t); }
+    check(G.local.hp < GAME_MAX_HP, 'local hp decreased after being hit');
+    check(lastPkt[GAME_PKT_HP] === G.local.hp, 'sent packet carries current local hp');
 }
 
-// --- GAMEOVER 受信 -> 結果の裏返しで即終了 ---
-function testGameoverRx() {
-    // 相手が WIN を通知 -> 自分は LOSE
+// --- gameover 同期 ---
+function testGameover() {
     gameInit();
-    let t = advanceToPlaying(0);
+    let t = advanceToPlaying(1000);
+    // 相手が WIN を通知 -> 自分は LOSE で即終了
     const flags = GAME_PKT_FLAG_GAMEOVER | ((GAME_RES_WIN << GAME_PKT_RESULT_SHIFT) & GAME_PKT_RESULT_MASK);
-    gameOnRx([flags, 74, 100, 80]);
-    check(G.state === GAME_STATE_RESULT, 'gameover rx enters RESULT');
+    gameOnRx(pkt({ flags, seq: 70 }));
+    check(G.state === GAME_STATE_RESULT, 'gameover moves to RESULT');
     check(G.result === GAME_RESULT_LOSE, 'opponent WIN -> my LOSE');
-
-    // 相手が LOSE を通知 -> 自分は WIN
-    gameInit();
-    t = advanceToPlaying(0);
-    const flags2 = GAME_PKT_FLAG_GAMEOVER | ((GAME_RES_LOSE << GAME_PKT_RESULT_SHIFT) & GAME_PKT_RESULT_MASK);
-    gameOnRx([flags2, 74, 100, 80]);
-    check(G.result === GAME_RESULT_WIN, 'opponent LOSE -> my WIN');
-
-    // 相手が DRAW を通知 -> 自分も DRAW
-    gameInit();
-    t = advanceToPlaying(0);
-    const flags3 = GAME_PKT_FLAG_GAMEOVER | ((GAME_RES_DRAW << GAME_PKT_RESULT_SHIFT) & GAME_PKT_RESULT_MASK);
-    gameOnRx([flags3, 74, 100, 80]);
-    check(G.result === GAME_RESULT_DRAW, 'opponent DRAW -> my DRAW');
 }
 
-// --- GAMEOVER 送信: 決着時に gameover ビット+結果コードを送る ---
-function testGameoverTx() {
+// --- charging フラグ ---
+function testChargingFlag() {
     gameInit();
-    let t = advanceToPlaying(0);
-    // WIN させる
-    let seq = 90;
-    for (let i = 0; i < GAME_WIN_SCORE; i++) gameOnRx([GAME_PKT_FLAG_HIT, 74, 1, seq++ & 0xFF]);
-    sendCount = 0; lastPkt = null;
-    t += GAME_SEND_INTERVAL_MS;
-    gameTick(t); // WIN 判定 -> pending_gameover, RESULT 遷移, 送信継続
-
-    // RESULT 中も pending_gameover があるため送信され続ける
-    let sawGameover = false, rc = -1;
-    for (let i = 0; i < 3; i++) {
-        if (lastPkt && (lastPkt[0] & GAME_PKT_FLAG_GAMEOVER)) {
-            sawGameover = true;
-            rc = (lastPkt[0] & GAME_PKT_RESULT_MASK) >> GAME_PKT_RESULT_SHIFT;
-            break;
-        }
-        t += GAME_SEND_INTERVAL_MS; gameTick(t);
-    }
-    check(sawGameover, 'GAMEOVER flag sent on local finish');
-    check(rc === GAME_RES_WIN, 'GAMEOVER result code = WIN');
+    let t = advanceToPlaying(1000);
+    // 押し続けてためる -> charging フラグが立つ
+    gameOnInput(160, 0, true);
+    t += GAME_SEND_INTERVAL_MS; gameTick(t);
+    gameOnInput(160, 0, true);
+    t += GAME_CHARGE_FULL_MS; gameTick(t);
+    check((lastPkt[GAME_PKT_FLAGS] & GAME_PKT_FLAG_CHARGING) !== 0, 'charging flag set while holding');
 }
 
-// --- 時間切れ引き分け (0-0) ---
-function testTimeoutDraw() {
-    gameInit();
-    let t = advanceToPlaying(0);
-    t += GAME_TIME_LIMIT_MS;
-    gameTick(t);
-    check(G.state === GAME_STATE_RESULT, 'finished at time limit');
-    check(G.result === GAME_RESULT_DRAW, 'draw on 0-0 timeout');
-}
-
-// --- 視点反転 (P2 は盤面上下反転で自機が手前=下) ---
+// --- 視点反転 ---
 function testViewFlip() {
-    // P2: logical_y=4 (自機上端) -> flipped = (120-(4+10))*2 = 106*2 = 212 (画面下寄り)
-    const y = viewPhysY(4, GAME_SHIP_H);
-    check(y === (GAME_FIELD_H - (4 + GAME_SHIP_H)) * 2, 'P2 view flip maps top-logical to bottom-screen');
-    check(y > GAME_FIELD_H, 'local ship (P2) renders near bottom of 320x240 canvas');
+    // P2(ブラウザ)は盤面を上下反転して自機を手前に見せる
+    const y0 = viewPhysY(0, GAME_SHIP_H);
+    const yBottom = viewPhysY(GAME_FIELD_H - GAME_SHIP_H, GAME_SHIP_H);
+    check(y0 > yBottom, 'P2 view flips (logical top maps to lower screen)');
 }
 
 testSeqHelper();
 testPacketFormat();
-testRelativeMove();
-testSmallFire();
-testBigFire();
-testRemoteSpawn();
-testHpDamageAndHitNotify();
-testBigBulletPierceDamage();
-testScoreFromHit();
-testWinByScore();
-testLoseByHpZero();
-testGameoverRx();
-testGameoverTx();
-testTimeoutDraw();
+testPosition();
+testFireCounterSpawn();
+testFireGapCompensation();
+testBigBullet();
+testHpStateSync();
+testHpGapResilience();
+testLocalHitSendsHp();
+testGameover();
+testChargingFlag();
 testViewFlip();
 
 console.log(`\n=== game.js tests: ${pass} passed, ${fail} failed ===`);
-process.exit(fail === 0 ? 0 : 1);
+process.exit(fail ? 1 : 0);

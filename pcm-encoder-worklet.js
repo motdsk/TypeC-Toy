@@ -24,8 +24,36 @@
  *         {type:'tx_done'}
  */
 
-const PCM_SYNC = [0x7FFF, -0x8000, 0x7FFF, -0x8000]; // int16 sync values
+// Sync（ブロック方式 / firmware pcm_transport.h と一致）
+//   [+FS]*BLK, [-FS]*BLK, [+FS]*BLK, [-FS]*BLK
+//   フルスケール正=0x7FFF, 負=-32767(0x8001。-32768クランプ回避)。
+//   低周波矩形波なのでホストのリサンプルを通してもピーク/極性が残り、
+//   受信側は「振幅閾値＋極性」で振幅非依存に検出できる。
+const PCM_SYNC_FS = 0x7FFF;
+const PCM_SYNC_NFS = -32767;
+const PCM_SYNC_BLK = 8;
+const PCM_SYNC_LEN = PCM_SYNC_BLK * 4; // 32
 const PCM_MAX_PAYLOAD = 255;
+
+// データのマンチェスター符号（firmware pcm_transport.h と一致）
+//   1ビット=PCM_CELLサンプル。ビット1=前半+FS/後半-FS、ビット0=前半-FS/後半+FS。
+//   データ先頭にスタートビット(=1)を1つ入れて受信位相を確定する。
+const PCM_CELL = 16;   // 速度優先（半セル=8）
+const PCM_CELL_HALF = PCM_CELL / 2;
+const PCM_DATA_FS = 0x7FFF;
+const PCM_DATA_NFS = -32767;
+
+function syncSample(i) {
+    const block = Math.floor(i / PCM_SYNC_BLK); // 0,1,2,3
+    return (block & 1) ? PCM_SYNC_NFS : PCM_SYNC_FS;
+}
+
+// 1ビットのマンチェスター波形（cell内サンプル位置 pos の値）
+function manTxSample(bit, pos) {
+    const firstHalf = (pos < PCM_CELL_HALF);
+    if (bit) return firstHalf ? PCM_DATA_FS : PCM_DATA_NFS;
+    return firstHalf ? PCM_DATA_NFS : PCM_DATA_FS;
+}
 
 function int16ToFloat(v) {
     // v is a signed int16 (-32768..32767). Map to [-1,1) via /32768 so that the
@@ -42,12 +70,30 @@ class PCMEncoderProcessor extends AudioWorkletProcessor {
         this.currentIndex = 0;
         this.seq = 0;             // internal sequence counter (mirrors pcm_transport tx.seq)
 
+        // 最新優先モード: ゲームのようなリアルタイム用途では、送出が間に合わず
+        // キューが溜まると「古い位置/入力」が遅延再生されて同期が崩れる。true の
+        // 間は、送出中に届いた新フレームで待機キューを上書きし、常に最新だけを送る。
+        this.latestOnly = true;
+
         this.port.onmessage = (event) => {
             const msg = event.data;
             if (msg.type === 'send') {
                 const samples = this.buildSamples(msg.frame);
                 if (samples) {
-                    this.txQueue.push(samples);
+                    if (msg.urgent) {
+                        samples._urgent = true;
+                        this.txQueue.push(samples);
+                    } else if (this.latestOnly) {
+                        // 位置のみ: 送出待ちの非イベントを最新に上書き（遅延蓄積防止）。
+                        const tail = this.txQueue[this.txQueue.length - 1];
+                        if (tail && !tail._urgent) {
+                            this.txQueue[this.txQueue.length - 1] = samples;
+                        } else {
+                            this.txQueue.push(samples);
+                        }
+                    } else {
+                        this.txQueue.push(samples);
+                    }
                     this.port.postMessage({
                         type: 'tx_start',
                         queueLen: this.txQueue.length,
@@ -63,16 +109,18 @@ class PCMEncoderProcessor extends AudioWorkletProcessor {
         };
     }
 
-    crc16(data) {
-        let crc = 0xFFFF;
+    // CRC-8 (多項式 0x07, init 0x00)。フレーム短縮のため CRC-16 から変更
+    // (firmware pcm_crc8 と一致)。フレームが1バイト短くなり、1フレーム内で
+    // 波形の乱れを踏む確率が下がって受信成功率が上がる。
+    crc8(data) {
+        let crc = 0x00;
         for (let i = 0; i < data.length; i++) {
-            crc ^= (data[i] << 8) & 0xFFFF;
+            crc ^= data[i] & 0xFF;
             for (let bit = 0; bit < 8; bit++) {
-                if (crc & 0x8000) crc = ((crc << 1) ^ 0x1021) & 0xFFFF;
-                else crc = (crc << 1) & 0xFFFF;
+                crc = (crc & 0x80) ? ((crc << 1) ^ 0x07) & 0xFF : (crc << 1) & 0xFF;
             }
         }
-        return crc;
+        return crc & 0xFF;
     }
 
     /**
@@ -90,27 +138,45 @@ class PCMEncoderProcessor extends AudioWorkletProcessor {
         bytes.push(this.seq & 0xFF);           // Seq
         bytes.push(len & 0xFF);                 // Len
         for (let i = 0; i < len; i++) bytes.push(payload[i] & 0xFF); // Payload
-        const crc = this.crc16(bytes);          // CRC over Seq+Len+Payload
-        bytes.push((crc >> 8) & 0xFF);          // CRC-hi
-        bytes.push(crc & 0xFF);                 // CRC-lo
+        const crc = this.crc8(bytes);           // CRC-8 over Seq+Len+Payload
+        bytes.push(crc & 0xFF);                 // CRC-8 (1バイト)
 
         this.seq = (this.seq + 1) & 0xFF;
 
-        // Sync samples (exact int16 values) + packed data samples.
-        const numData = Math.ceil(bytes.length / 2);
-        const out = new Float32Array(PCM_SYNC.length + numData);
+        // Sync(32 sample) + start bit(1) + data bits(8/byte) をマンチェスターで。
+        // 末尾に1セル分のポストアンブル(無音)を足し、受信側が最終ビットの
+        // 中央遷移後の半セルを観測して確定できるようにする。
+        const numBits = 1 /*start*/ + bytes.length * 8;
+        const out = new Float32Array(PCM_SYNC_LEN + numBits * PCM_CELL + PCM_CELL);
 
         let oi = 0;
-        for (let i = 0; i < PCM_SYNC.length; i++) {
-            out[oi++] = int16ToFloat(PCM_SYNC[i]);
+        // Sync ブロック
+        for (let i = 0; i < PCM_SYNC_LEN; i++) {
+            out[oi++] = int16ToFloat(syncSample(i));
         }
-        for (let bi = 0; bi < bytes.length; bi += 2) {
-            const hi = bytes[bi];
-            const lo = (bi + 1 < bytes.length) ? bytes[bi + 1] : 0; // zero-pad low byte
-            // s = (hi << 8) | lo, interpreted as signed int16
-            let s = ((hi << 8) | lo) & 0xFFFF;
-            if (s >= 0x8000) s -= 0x10000;
-            out[oi++] = int16ToFloat(s);
+        // スタートビット(=1)
+        for (let p = 0; p < PCM_CELL; p++) {
+            out[oi++] = int16ToFloat(manTxSample(1, p));
+        }
+        // データバイト（MSB first）
+        let lastHalfPol = 0; // 最終ビット後半の極性（終端エッジ生成用）
+        for (let bi = 0; bi < bytes.length; bi++) {
+            const byte = bytes[bi];
+            for (let b = 0; b < 8; b++) {
+                const bit = (byte >> (7 - b)) & 1;
+                for (let p = 0; p < PCM_CELL; p++) {
+                    out[oi++] = int16ToFloat(manTxSample(bit, p));
+                }
+                // 各ビット後半の極性: bit1→後半-, bit0→後半+
+                lastHalfPol = bit ? -1 : 1;
+            }
+        }
+        // 終端: 最終ビット後半と逆極性の1セルを足す。これで受信側に必ず
+        // 「最終ビットの後半スロットを確定させるエッジ」が立つ（末尾ビット取りこぼし防止）。
+        const endPol = -lastHalfPol;
+        const endVal = (endPol === 1) ? PCM_DATA_FS : PCM_DATA_NFS;
+        for (let p = 0; p < PCM_CELL; p++) {
+            out[oi++] = int16ToFloat(endVal);
         }
         return out;
     }

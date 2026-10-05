@@ -44,8 +44,9 @@ const GAME_MAX_HP = 5;
 const GAME_WIN_SCORE = GAME_MAX_HP;      // 5
 const GAME_TIME_LIMIT_MS = 60000;
 const GAME_COUNTDOWN_MS = 3000;
-const GAME_SEND_INTERVAL_MS = 20;        // 50Hz
-const GAME_TICK_INTERVAL_MS = 20;        // ローカルループ 50Hz
+const GAME_SEND_INTERVAL_MS = 40;        // 送信 25Hz（PCM搬送の詰まり回避。firmwareと一致）
+const GAME_TICK_INTERVAL_MS = 20;        // ローカルループは 50Hz 維持（描画・入力は滑らかに）
+const GAME_TICK_BASE_MS = 20;            // 弾速の基準周期。弾移動は経過時間/この値のステップ数ぶん進める（firmwareと一致、tick頻度非依存で実速度一定）
 
 const GAME_MOVE_SENS_PCT = 70;
 const GAME_CHARGE_MIN_MS = 450;
@@ -54,13 +55,21 @@ const GAME_SMALL_DAMAGE = 1;
 const GAME_BIG_DAMAGE = 3;
 const GAME_FIRE_LOCKOUT_MS = 250;
 
-const GAME_PKT_LEN = 4;
-const GAME_PKT_FLAG_FIRE = 0x01;
-const GAME_PKT_FLAG_HIT = 0x02;
-const GAME_PKT_FLAG_CFIRE = 0x04;
-const GAME_PKT_FLAG_GAMEOVER = 0x08;
-const GAME_PKT_RESULT_SHIFT = 4;
-const GAME_PKT_RESULT_MASK = 0x30;
+// 状態同期パケット（6バイト。firmware game_shooter.h と一致）
+//   [0]x [1]y [2]fire_cnt(bit0-6=累積7bit,bit7=大弾) [3]hp [4]flags [5]seq
+const GAME_PKT_LEN = 6;
+const GAME_PKT_X = 0;
+const GAME_PKT_Y = 1;
+const GAME_PKT_FIRECNT = 2;
+const GAME_PKT_HP = 3;
+const GAME_PKT_FLAGS = 4;
+const GAME_PKT_SEQ = 5;
+const GAME_PKT_FIRE_BIG_BIT = 0x80;
+const GAME_PKT_FIRE_CNT_MASK = 0x7F;
+const GAME_PKT_FLAG_GAMEOVER = 0x01;
+const GAME_PKT_RESULT_SHIFT = 1;
+const GAME_PKT_RESULT_MASK = 0x06;
+const GAME_PKT_FLAG_CHARGING = 0x08;
 
 // gameover 時の result エンコード (2bit)
 const GAME_RES_WIN = 1;
@@ -152,10 +161,11 @@ const G = {
     txSeq: 0,
     lastRxSeq: 0,
     haveRx: false,
-    pendingHit: false,
-    pendingHitDmg: 0,
-    pendingFire: false,
-    pendingCfire: false,
+    // 状態同期: 発射は累積カウンタで送る（欠落耐性）
+    fireCount: 0,
+    lastFireBig: false,
+    lastRxFireCnt: 0,
+    rxFireInit: false,
     pendingGameover: false,
     myResultCode: 0,
 
@@ -181,6 +191,11 @@ const G = {
 function stateEnter(st) {
     G.state = st;
     G.stateEnterMs = G.nowMs;
+    if (st === GAME_STATE_PLAYING) {
+        // 弾移動の経過時間基準をリセット(カウントダウン分を持ち込まない)
+        G.lastTickMs = G.nowMs;
+        G.stepAccMs = 0;
+    }
 }
 
 function gameInit() {
@@ -198,16 +213,18 @@ function gameInit() {
     G.txSeq = 0;
     G.lastRxSeq = 0;
     G.haveRx = false;
-    G.pendingHit = false;
-    G.pendingHitDmg = 0;
-    G.pendingFire = false;
-    G.pendingCfire = false;
+    G.fireCount = 0;
+    G.lastFireBig = false;
+    G.lastRxFireCnt = 0;
+    G.rxFireInit = false;
     G.pendingGameover = false;
     G.myResultCode = 0;
     G.nowMs = 0;
     G.lastSendMs = 0;
     G.everSent = false;
     G.stateEnterMs = 0;
+    G.lastTickMs = 0;    // 経過時間ベース弾移動用
+    G.stepAccMs = 0;
 
     // 移動/チャージ状態初期化
     G.haveAnchor = false;
@@ -285,42 +302,49 @@ function gameOnInput(localX, localY, fire) {
 function gameOnRx(data) {
     if (!G.initialized || !data || data.length < GAME_PKT_LEN) return;
 
-    const flags = data[0];
-    const rxX = data[1];
-    const rxY = data[2];
-    const rxSeq = data[3];
+    const rxX = data[GAME_PKT_X];
+    const rxY = data[GAME_PKT_Y];
+    const fireCntRaw = data[GAME_PKT_FIRECNT];
+    const rxHp = data[GAME_PKT_HP];
+    const flags = data[GAME_PKT_FLAGS];
+    const rxSeq = data[GAME_PKT_SEQ];
+
+    const fireCnt = fireCntRaw & GAME_PKT_FIRE_CNT_MASK;
+    const fireBig = (fireCntRaw & GAME_PKT_FIRE_BIG_BIT) !== 0;
 
     if (!G.haveRx) {
-        // MATCHING 確立: 最初の受信は無条件採用
+        // MATCHING 確立: 最初の受信は無条件採用。発射カウンタ基準も取得。
         G.haveRx = true;
         G.lastRxSeq = rxSeq;
+        G.lastRxFireCnt = fireCnt;
+        G.rxFireInit = true;
     } else {
-        if (!seqIsNewer(rxSeq, G.lastRxSeq)) {
-            return; // 古い/重複は破棄
-        }
+        // 古い/重複は破棄。状態同期なので破棄してもずれない。
+        if (!seqIsNewer(rxSeq, G.lastRxSeq)) return;
         G.lastRxSeq = rxSeq;
     }
 
-    // 相手機の位置更新（HIT時は data[2] がダメージ量なので Y は更新しない）
+    // 相手機の位置更新（絶対座標。欠落しても最新で復帰）
     G.remote.x = clampI(rxX, 0, GAME_FIELD_W - GAME_SHIP_W);
-    if (!(flags & GAME_PKT_FLAG_HIT)) {
-        G.remote.y = clampI(rxY, 0, GAME_FIELD_H - GAME_SHIP_H);
+    G.remote.y = clampI(rxY, 0, GAME_FIELD_H - GAME_SHIP_H);
+
+    // 発射: 累積カウンタの差分だけスポーン（欠落補償）
+    let diff = (fireCnt - G.lastRxFireCnt) & GAME_PKT_FIRE_CNT_MASK;
+    if (diff > 0) {
+        if (diff > GAME_MAX_BULLETS) diff = GAME_MAX_BULLETS;
+        for (let k = 0; k < diff; k++) {
+            const big = (k === diff - 1) ? fireBig : false;
+            spawnBulletEx(G.remote, !G.isP1, big);
+        }
+        G.lastRxFireCnt = fireCnt;
     }
 
-    // 相手が発射 -> 相手機から相手の向きで弾をスポーン（決定論同期）
-    if (flags & GAME_PKT_FLAG_FIRE) {
-        spawnBulletEx(G.remote, !G.isP1, /*big=*/false);
-    }
-    if (flags & GAME_PKT_FLAG_CFIRE) {
-        spawnBulletEx(G.remote, !G.isP1, /*big=*/true);
-    }
-
-    // 相手が被弾を通知 -> 自分の与ダメージ(score)に加算（権威=被弾側）
-    if (flags & GAME_PKT_FLAG_HIT) {
-        const dmg = rxY ? rxY : 1;
-        if (G.local.score + dmg > 0xFF) G.local.score = 0xFF;
-        else G.local.score += dmg;
-    }
+    // 与ダメージ(score): 相手HP現在値から直接算出（ずれない）
+    const oppHp = (rxHp <= GAME_MAX_HP) ? rxHp : GAME_MAX_HP;
+    const myScore = GAME_MAX_HP - oppHp;
+    if (myScore > G.local.score) G.local.score = myScore; // 単調増加
+    G.remote.hp = oppHp;
+    G.remote.alive = (oppHp > 0);
 
     // 相手が決着を通知 -> 相手の結果の裏返しで自分も即終了（両機同時終了）
     if (flags & GAME_PKT_FLAG_GAMEOVER) {
@@ -344,33 +368,25 @@ function sendInputPacket() {
     if (!encoderNode && !_testSendHook) return;
 
     let flags = 0;
-    let data2 = G.local.y & 0xFF; // 既定はY。hit時のみダメージ量に差替。
+    // 発射累積カウンタ: 下位7bit + 大弾フラグ(bit7)
+    let fireByte = G.fireCount & GAME_PKT_FIRE_CNT_MASK;
+    if (G.lastFireBig) fireByte |= GAME_PKT_FIRE_BIG_BIT;
 
-    if (G.pendingFire) {
-        flags |= GAME_PKT_FLAG_FIRE;
-        G.pendingFire = false;
-    }
-    if (G.pendingCfire) {
-        flags |= GAME_PKT_FLAG_CFIRE;
-        G.pendingCfire = false;
-    }
-    if (G.pendingHit) {
-        flags |= GAME_PKT_FLAG_HIT; // 自機被弾を通知。data2 にダメージ量。
-        data2 = (G.pendingHitDmg ? G.pendingHitDmg : 1) & 0xFF;
-        G.pendingHit = false;
-        G.pendingHitDmg = 0;
-    }
+    if (G.chargeLevel > 0) flags |= GAME_PKT_FLAG_CHARGING;
+
     if (G.pendingGameover) {
         flags |= GAME_PKT_FLAG_GAMEOVER;
         flags |= (G.myResultCode << GAME_PKT_RESULT_SHIFT) & GAME_PKT_RESULT_MASK;
-        // gameover は届くまで送り続けるため pending はここでクリアしない。
+        // gameover は届くまで送り続けるため pending はクリアしない。
     }
 
     const pkt = [
-        flags & 0xFF,
-        G.local.x & 0xFF,
-        data2 & 0xFF,
-        G.txSeq & 0xFF,
+        G.local.x & 0xFF,          // [0] x
+        G.local.y & 0xFF,          // [1] y
+        fireByte & 0xFF,           // [2] fire_cnt
+        G.local.hp & 0xFF,         // [3] hp (相手が score 算出に使う)
+        flags & 0xFF,              // [4] flags
+        G.txSeq & 0xFF,            // [5] seq
     ];
     G.txSeq = (G.txSeq + 1) & 0xFF;
 
@@ -378,7 +394,8 @@ function sendInputPacket() {
         _testSendHook(pkt);
         return;
     }
-    // ゲームパケット(4バイト)を PCM トランスポートのペイロードとして送出。
+    // 状態同期パケット(6バイト)を PCM トランスポートで送出。
+    // 全パケットが「現在の状態」なので最新優先でよい（古いものは捨てて問題なし）。
     // worklet 側が Seq/Len/CRC の搬送フレーミングを付与する。
     encoderNode.port.postMessage({ type: 'send', frame: pkt });
 }
@@ -386,7 +403,10 @@ function sendInputPacket() {
 // ============================================================================
 // 弾移動と当たり判定（update_bullets_and_collisions を写像）
 // ============================================================================
-function updateBulletsAndCollisions() {
+// 弾を steps ステップ分進める（1ステップ=基準周期ぶんの移動）。衝突は各ステップで
+// 判定し、速い弾/大ステップでのすり抜けを防ぐ。firmware と同一ロジック。
+function updateBulletsAndCollisions(steps) {
+  for (let st = 0; st < steps; st++) {
     // --- 自弾を移動し、相手機への命中を判定（表示の見栄え用） ---
     for (let i = 0; i < GAME_MAX_BULLETS; i++) {
         const b = G.local.bullets[i];
@@ -415,17 +435,14 @@ function updateBulletsAndCollisions() {
         if (G.local.alive && bulletHitsShip(b, G.local)) {
             const dmg = b.damage ? b.damage : 1;
             if (!b.charged) b.active = false; // 通常弾は消す、チャージ弾は貫通
-            const before = G.local.hp;
+            // 状態同期: 自HPを減らすだけ。相手は send の自HP現在値から
+            // score = MAX_HP - 自HP で復元する（被弾イベント通知は不要）。
             if (G.local.hp > dmg) G.local.hp -= dmg;
             else G.local.hp = 0;
-            if (before !== G.local.hp) {
-                const applied = before - G.local.hp;
-                G.pendingHit = true;
-                G.pendingHitDmg = applied;
-            }
             if (G.local.hp === 0) G.local.alive = false;
         }
     }
+  }
 }
 
 // ============================================================================
@@ -501,20 +518,27 @@ function gameTick(nowMs) {
                 } else if (!touchNow && G.prevTouching) {
                     // 離した瞬間: 発射。ため量で小弾/大弾を決める。
                     const held = G.nowMs - G.chargeStartMs;
-                    if (held >= GAME_CHARGE_FULL_MS) {
-                        spawnBulletEx(G.local, G.isP1, /*big=*/true);
-                        G.pendingCfire = true;
-                    } else {
-                        spawnBulletEx(G.local, G.isP1, /*big=*/false);
-                        G.pendingFire = true;
-                    }
+                    const big = (held >= GAME_CHARGE_FULL_MS);
+                    spawnBulletEx(G.local, G.isP1, big);
+                    // 状態同期: 発射累積カウンタを進める。相手は差分でスポーン。
+                    G.fireCount = (G.fireCount + 1) & GAME_PKT_FIRE_CNT_MASK;
+                    G.lastFireBig = big;
                     G.chargeLevel = 0;
                 }
                 if (!touchNow) G.chargeLevel = 0;
             }
             G.prevTouching = G.touching;
 
-            updateBulletsAndCollisions();
+            // 経過時間ベースで弾を進める（firmware と同一）。前回tickからのΔmsを
+            // 蓄積し、基準周期ごとに1ステップ消化。tick頻度に依存せず実速度一定。
+            {
+                let dt = (G.lastTickMs === 0) ? GAME_TICK_BASE_MS : (nowMs - G.lastTickMs);
+                if (dt > 200) dt = 200;  // 一時停止/初回の暴走防止
+                G.stepAccMs += dt;
+                const steps = Math.floor(G.stepAccMs / GAME_TICK_BASE_MS);
+                G.stepAccMs -= steps * GAME_TICK_BASE_MS;
+                updateBulletsAndCollisions(steps);
+            }
             checkResult();
             break;
         }
@@ -534,6 +558,7 @@ function gameTick(nowMs) {
             G.everSent = true;
         }
     }
+    G.lastTickMs = nowMs;   // 次tickの経過時間計算用
 }
 
 // ============================================================================
@@ -567,26 +592,112 @@ const COL_EBULLET_B = '#ff40ff'; // 相手弾 大 (マゼンタ)
 const COL_TEXT = '#e0e0e0';
 const COL_CYAN = '#00d4aa';
 
-function drawShipRect(x, y, w, h, color) {
+// ============================================================================
+// スプライト（インベーダー風ドット絵）。11列×8行のビットマップ（文字列で定義）。
+// 自機は砲台/宇宙船、敵機はインベーダー。論理機体サイズ 12x10 の枠に収める。
+// 各行の '1' を1ドットとして fillRect で拡大描画する。
+// ============================================================================
+const SPRITE_W = 11, SPRITE_H = 8;
+
+// 自機（下向きに構える砲台/シップ）
+const SPRITE_SHIP = [
+    '00000100000',
+    '00000100000',
+    '00001110000',
+    '00011111000',
+    '01111111110',
+    '11111111111',
+    '11011111011',
+    '10000000001',
+];
+
+// 敵機（インベーダー）: 2枚のアニメーションフレーム（脚パタパタ）
+const SPRITE_INVADER_A = [
+    '00100000100',
+    '00010001000',
+    '00111111100',
+    '01101110110',
+    '11111111111',
+    '10111111101',
+    '10100000101',
+    '00011011000',
+];
+const SPRITE_INVADER_B = [
+    '00100000100',
+    '10010001001',
+    '10111111101',
+    '11101110111',
+    '11111111111',
+    '01111111110',
+    '00100000100',
+    '01000000010',
+];
+
+// 論理機体(12x10)の中にスプライト(11x8)を中央寄せして描く。
+// 1ドット = dotW x dotH の矩形（物理px）。
+function drawSprite(rows, logicalX, logicalY, color) {
+    const originPhysX = logicalX * SCALE_X;
+    const originPhysY = viewPhysY(logicalY, GAME_SHIP_H);
+    // 機体枠(12x10論理 -> 24x20物理)にスプライト11x8を収める。ドットサイズを算出。
+    const dotW = (GAME_SHIP_W * SCALE_X) / SPRITE_W;   // ~2.18
+    const dotH = (GAME_SHIP_H * SCALE_Y) / SPRITE_H;   // ~2.5
     gctx.fillStyle = color;
-    gctx.fillRect(x, y, w, h);
+    for (let r = 0; r < rows.length; r++) {
+        const row = rows[r];
+        for (let c = 0; c < row.length; c++) {
+            if (row[c] === '1') {
+                gctx.fillRect(
+                    Math.floor(originPhysX + c * dotW),
+                    Math.floor(originPhysY + r * dotH),
+                    Math.ceil(dotW), Math.ceil(dotH));
+            }
+        }
+    }
+}
+
+// 敵機アニメーション用のフレームトグル（時間で切り替え）
+function invaderFrame() {
+    return (Math.floor(G.nowMs / 350) & 1) ? SPRITE_INVADER_B : SPRITE_INVADER_A;
 }
 
 function drawShip(s, color) {
     if (!s.alive) return;
-    drawShipRect(s.x * SCALE_X, viewPhysY(s.y, GAME_SHIP_H),
-                 GAME_SHIP_W * SCALE_X, GAME_SHIP_H * SCALE_Y, color);
+    drawSprite(SPRITE_SHIP, s.x, s.y, color);
 }
 
+function drawEnemy(s, color) {
+    if (!s.alive) return;
+    drawSprite(invaderFrame(), s.x, s.y, color);
+}
+
+// 弾の描画。通常弾=縦長の弾（涙型っぽい楕円）、チャージ弾=大きい丸。
 function drawBullets(s, colorSmall, colorBig) {
     for (let i = 0; i < GAME_MAX_BULLETS; i++) {
         const b = s.bullets[i];
         if (!b.active) continue;
-        const bw = b.charged ? 6 : 2;
-        const bh = b.charged ? 5 : 3;
-        gctx.fillStyle = b.charged ? colorBig : colorSmall;
-        gctx.fillRect((b.x - Math.floor(bw / 2)) * SCALE_X, viewPhysY(b.y, bh),
-                      bw * SCALE_X, bh * SCALE_Y);
+        const cx = b.x * SCALE_X;
+        const cy = viewPhysY(b.y, 1);
+        if (b.charged) {
+            // チャージ弾: 大きい丸（グロー付き）
+            const r = 8;
+            gctx.fillStyle = colorBig;
+            gctx.beginPath();
+            gctx.arc(cx, cy, r, 0, Math.PI * 2);
+            gctx.fill();
+            // 中心ハイライト
+            gctx.fillStyle = '#ffffff';
+            gctx.globalAlpha = 0.5;
+            gctx.beginPath();
+            gctx.arc(cx, cy, r * 0.4, 0, Math.PI * 2);
+            gctx.fill();
+            gctx.globalAlpha = 1.0;
+        } else {
+            // 通常弾: 縦長の弾（楕円）
+            gctx.fillStyle = colorSmall;
+            gctx.beginPath();
+            gctx.ellipse(cx, cy, 2.5, 6, 0, 0, Math.PI * 2);
+            gctx.fill();
+        }
     }
 }
 
@@ -654,10 +765,10 @@ function gameRender() {
             drawBullets(G.remote, COL_EBULLET_S, COL_EBULLET_B);
             drawBullets(G.local, COL_BULLET_S, COL_BULLET_B);
 
-            // 相手機 (赤, 画面奥=上)
-            drawShip(G.remote, COL_ENEMY);
+            // 相手機 (インベーダー, 画面奥=上)
+            drawEnemy(G.remote, COL_ENEMY);
 
-            // 自機 (手前=下)。ため段階で色替え。
+            // 自機 (砲台/シップ, 手前=下)。ため段階で色替え。
             const shipColor = (G.chargeLevel >= 2) ? COL_YOU_CHG2
                             : (G.chargeLevel === 1) ? COL_YOU_CHG1 : COL_YOU;
             drawShip(G.local, shipColor);
@@ -815,22 +926,43 @@ if (_hasDOM && navigator.mediaDevices && navigator.mediaDevices.addEventListener
 }
 
 // PCM worklet の読み込み・ノード生成・配線（paint.js setupTransport の PCM 部を流用）
+// worklet はブラウザに強くキャッシュされ、ハードリロードでも古い版が残ることが
+// ある。URL にビルド時刻のクエリを付けてキャッシュを確実に無効化する。
+const _WL_VER = '?v=' + Date.now();
+
 async function setupTransport() {
     // Encoder (TX)
-    await audioContext.audioWorklet.addModule('pcm-encoder-worklet.js');
+    await audioContext.audioWorklet.addModule('pcm-encoder-worklet.js' + _WL_VER);
     encoderNode = new AudioWorkletNode(audioContext, 'pcm-encoder-processor', { outputChannelCount: [1] });
+    let _txStarts = 0, _txDones = 0;
     encoderNode.port.onmessage = (e) => {
-        // tx_start / tx_done はデバッグログのみ
+        // 送信の生存確認: tx_start/tx_done を数えて 1 秒ごとにログ。
+        // ここが増えていれば「ブラウザは送出している」= 問題は経路/受信側。
+        const t = e.data && e.data.type;
+        if (t === 'tx_start') _txStarts++;
+        else if (t === 'tx_done') _txDones++;
     };
+    setInterval(() => {
+        if (!encoderNode) return;
+        console.log('[TX] pkt_started=' + _txStarts + ' pkt_done=' + _txDones);
+    }, 1000);
     encoderNode.connect(audioContext.destination);
 
     // Decoder (RX)
     if (mediaStream) {
-        await audioContext.audioWorklet.addModule('pcm-decoder-worklet.js');
+        await audioContext.audioWorklet.addModule('pcm-decoder-worklet.js' + _WL_VER);
         decoderNode = new AudioWorkletNode(audioContext, 'pcm-decoder-processor', { numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1 });
         decoderNode.port.onmessage = (e) => handleRx(e.data);
         const source = audioContext.createMediaStreamSource(mediaStream);
         source.connect(decoderNode);
+        // デバッグ用フック: 双方向衝突の切り分けのため、CDP から受信(RX)だけを
+        // 止められるようにする。window.__rxDisconnect() で decoder への入力を切り、
+        // 送信(TX)はそのまま継続する。本番動作には影響しない。
+        try {
+            window.__rxSource = source;
+            window.__rxDisconnect = () => { try { source.disconnect(); console.log('[DBG] RX disconnected (send-only)'); } catch (e) {} };
+            window.__rxReconnect = () => { try { source.connect(decoderNode); console.log('[DBG] RX reconnected'); } catch (e) {} };
+        } catch (e) {}
         console.log('[RX] Decoder connected (pcm)');
     }
 }
@@ -841,11 +973,29 @@ async function connect() {
         audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
         if (audioContext.state === 'suspended') await audioContext.resume();
 
-        // 出力デバイス設定
+        // 出力デバイス設定。
+        // 重要: ブラウザ(P2)の音は「スピーカ出力」として CoreS3 の UAC OUT に
+        // 流し込む必要がある。出力先を CoreS3 に向けないと音は PC 既定スピーカへ
+        // 流れ、CoreS3 側には 1 サンプルも届かず MATCHING から抜けられない
+        // (実機画面の NZ=0 の状態)。出力先の選択を必須扱いにして警告する。
         const selectedOutput = outputSelect.value;
+        const selectedOutputLabel = outputSelect.options[outputSelect.selectedIndex]
+            ? outputSelect.options[outputSelect.selectedIndex].textContent : '';
+        if (!selectedOutput) {
+            console.warn('[TX] 出力先が未選択(既定出力)。CoreS3 に音が届かない可能性大。上の Output で CoreS3 を選択してください。');
+            setLog('⚠ Output で CoreS3 を選んでから Connect してください');
+        }
+        if (!audioContext.setSinkId) {
+            console.warn('[TX] このブラウザは AudioContext.setSinkId 非対応。OS の既定再生デバイスを CoreS3 にしてください。');
+        }
         if (selectedOutput && audioContext.setSinkId) {
-            try { await audioContext.setSinkId(selectedOutput); }
-            catch (e) { console.warn('setSinkId failed:', e); }
+            try {
+                await audioContext.setSinkId(selectedOutput);
+                console.log('[TX] 出力先を設定:', selectedOutputLabel, '(sinkId=' + audioContext.sinkId + ')');
+            } catch (e) {
+                console.warn('[TX] setSinkId 失敗:', e);
+                setLog('⚠ 出力先の設定に失敗: ' + (e && e.message ? e.message : e));
+            }
         }
 
         // マイク取得（送受信両対応。失敗時は送信専用）
@@ -938,8 +1088,20 @@ function handleRx(data) {
         if (payload && payload.length >= GAME_PKT_LEN) {
             gameOnRx(payload);
         }
+    } else if (data.type === 'dbg') {
+        // デコーダ process() の起動診断。hasInput=false / chLen=0 ならマイク未供給。
+        console.log('[RX dbg] call=' + data.call + ' hasInput=' + data.hasInput + ' chLen=' + data.chLen);
+    } else if (data.type === 'stats') {
+        // 実機画面の NZ/SY/FR/CE/HI/PK 相当。ブラウザ側の受信健全性を可視化。
+        console.log('[RX stats] SY=' + data.sync + ' FR=' + data.frames + ' CE=' + data.crcErrors +
+            ' HI=' + data.hi + ' PK+=' + data.peakPos + ' PK-=' + data.peakNeg +
+            ' runTop(len:count)=' + (data.runTop ? data.runTop.join(' ') : ''));
+    } else if (data.type === 'crc_error') {
+        // CRC不一致の詳細（ビットずれ診断用）。頻発するとノイズになるので簡潔に。
+        console.log('[RX crc_err] len=' + data.payloadLen +
+            ' first=' + JSON.stringify(data.firstBytes) +
+            ' recv=' + data.received + ' exp=' + data.expected);
     }
-    // crc_error / stats は本ゲームでは無視（デバッグはコンソールで）
 }
 
 // ============================================================================
@@ -954,8 +1116,9 @@ if (typeof module !== 'undefined' && module.exports) {
         GAME_SMALL_DAMAGE, GAME_BIG_DAMAGE,
         GAME_MOVE_SENS_PCT, GAME_CHARGE_MIN_MS, GAME_CHARGE_FULL_MS,
         GAME_PKT_LEN,
-        GAME_PKT_FLAG_FIRE, GAME_PKT_FLAG_HIT, GAME_PKT_FLAG_CFIRE,
-        GAME_PKT_FLAG_GAMEOVER, GAME_PKT_RESULT_SHIFT, GAME_PKT_RESULT_MASK,
+        GAME_PKT_X, GAME_PKT_Y, GAME_PKT_FIRECNT, GAME_PKT_HP, GAME_PKT_FLAGS, GAME_PKT_SEQ,
+        GAME_PKT_FIRE_BIG_BIT, GAME_PKT_FIRE_CNT_MASK,
+        GAME_PKT_FLAG_GAMEOVER, GAME_PKT_RESULT_SHIFT, GAME_PKT_RESULT_MASK, GAME_PKT_FLAG_CHARGING,
         GAME_RES_WIN, GAME_RES_LOSE, GAME_RES_DRAW,
         GAME_COUNTDOWN_MS, GAME_TIME_LIMIT_MS, GAME_SEND_INTERVAL_MS,
         SCALE_X, SCALE_Y, LCD_W, LCD_H,
