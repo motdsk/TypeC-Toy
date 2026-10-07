@@ -27,7 +27,8 @@ const {
     GAME_STATE_PLAYING, GAME_STATE_MATCHING, GAME_STATE_RESULT,
     GAME_RESULT_WIN, GAME_RESULT_LOSE, GAME_RESULT_DRAW,
     seqIsNewer, viewPhysY,
-    G, gameInit, gameOnInput, gameOnRx, gameTick,
+    GAME_RESULT_HOLD_MS,
+    G, gameInit, gameRestart, gameOnInput, gameOnRx, gameTick,
 } = g;
 
 let pass = 0, fail = 0;
@@ -215,6 +216,59 @@ testLocalHitSendsHp();
 testGameover();
 testChargingFlag();
 testViewFlip();
+
+// ============================================================================
+// 連続プレイ: RESULT を一定時間表示したら自動で MATCHING へ戻る。
+// ============================================================================
+function testAutoRestart() {
+    gameInit();
+    let t = 1000;
+    advanceToPlaying(t);
+    t += GAME_COUNTDOWN_MS;
+    // 相手を倒して WIN -> RESULT に入れる（相手HP=0 を送る）
+    gameOnRx(pkt({ hp: 0, seq: 50 }));
+    gameTick(t);
+    check(G.state === GAME_STATE_RESULT, 'auto-restart: entered RESULT after win');
+    const seqBefore = G.txSeq;
+
+    // HOLD 未満ではまだ RESULT のまま
+    t += GAME_RESULT_HOLD_MS - 100;
+    gameTick(t);
+    check(G.state === GAME_STATE_RESULT, 'auto-restart: still RESULT before hold elapses');
+
+    // HOLD 経過で MATCHING へ自動復帰。状態はリセット、seq は継続。
+    t += 200;
+    gameTick(t);
+    check(G.state === GAME_STATE_MATCHING, 'auto-restart: back to MATCHING after hold');
+    check(G.local.hp === GAME_MAX_HP, 'auto-restart: HP reset to full');
+    check(G.local.score === 0, 'auto-restart: score reset');
+    check(G.haveRx === false, 'auto-restart: haveRx cleared for re-match');
+    check(seqIsNewer(G.txSeq, seqBefore) || G.txSeq === seqBefore,
+        'auto-restart: txSeq continues (not reset to 0 mid-stream)');
+}
+
+// 再 MATCHING 直後に相手の「古い GAMEOVER」が届いても即終了しないこと。
+function testNoInstantEndAfterRestart() {
+    gameInit();
+    let t = 2000;
+    advanceToPlaying(t);
+    t += GAME_COUNTDOWN_MS;
+    gameOnRx(pkt({ hp: 0, seq: 60 }));
+    gameTick(t);                    // -> RESULT
+    t += GAME_RESULT_HOLD_MS + 50;
+    gameTick(t);                    // -> MATCHING (auto restart)
+    check(G.state === GAME_STATE_MATCHING, 'post-restart: in MATCHING');
+
+    // 相手の古い GAMEOVER パケットが遅れて届く（MATCHING 中）。
+    const stale = pkt({ flags: GAME_PKT_FLAG_GAMEOVER | (GAME_RES_WIN << GAME_PKT_RESULT_SHIFT), seq: 70 });
+    gameOnRx(stale);
+    // MATCHING 中の GAMEOVER は無視され、最初のパケットとして扱われ COUNTDOWN へ。
+    gameTick(t);
+    check(G.state !== GAME_STATE_RESULT, 'post-restart: stale GAMEOVER does not force RESULT');
+}
+
+testAutoRestart();
+testNoInstantEndAfterRestart();
 
 console.log(`\n=== game.js tests: ${pass} passed, ${fail} failed ===`);
 process.exit(fail ? 1 : 0);

@@ -44,6 +44,8 @@ const GAME_MAX_HP = 5;
 const GAME_WIN_SCORE = GAME_MAX_HP;      // 5
 const GAME_TIME_LIMIT_MS = 60000;
 const GAME_COUNTDOWN_MS = 3000;
+// 連続プレイ: RESULT をこの時間表示したら自動で次戦(MATCHING)へ戻る（firmware と一致）。
+const GAME_RESULT_HOLD_MS = 4000;
 const GAME_SEND_INTERVAL_MS = 40;        // 送信 25Hz（PCM搬送の詰まり回避。firmwareと一致）
 const GAME_TICK_INTERVAL_MS = 20;        // ローカルループは 50Hz 維持（描画・入力は滑らかに）
 const GAME_TICK_BASE_MS = 20;            // 弾速の基準周期。弾移動は経過時間/この値のステップ数ぶん進める（firmwareと一致、tick頻度非依存で実速度一定）
@@ -239,6 +241,44 @@ function gameInit() {
 }
 
 // ============================================================================
+// 連続プレイ用リスタート（firmware game_restart を写像）
+//   通信路(worklet)は維持したまま、ゲーム状態だけ作り直して MATCHING へ戻す。
+//   txSeq は継続させ(相手の newest-wins を壊さない)、haveRx をリセットして
+//   新ゲームの最初のパケットで再マッチングする。nowMs/lastSendMs は維持。
+// ============================================================================
+function gameRestart() {
+    const keepTxSeq = G.txSeq;
+    const keepNow = G.nowMs;
+    resetShip(G.local, IS_PLAYER_ONE);
+    resetShip(G.remote, !IS_PLAYER_ONE);
+    G.homeY = IS_PLAYER_ONE ? (GAME_FIELD_H - GAME_SHIP_H - 4) : 4;
+    G.result = GAME_RESULT_NONE;
+    G.prevFire = false;
+    G.lastRxSeq = 0;
+    G.haveRx = false;
+    G.fireCount = 0;
+    G.lastFireBig = false;
+    G.lastRxFireCnt = 0;
+    G.rxFireInit = false;
+    G.pendingGameover = false;
+    G.myResultCode = 0;
+    G.txSeq = keepTxSeq;      // seq は継続
+    G.nowMs = keepNow;
+    G.lastSendMs = 0;
+    G.everSent = false;
+    G.lastTickMs = 0;
+    G.stepAccMs = 0;
+    G.haveAnchor = false;
+    G.anchorTouchX = 0;
+    G.anchorShipX = G.local.x;
+    G.touching = false;
+    G.prevTouching = false;
+    G.chargeStartMs = 0;
+    G.chargeLevel = 0;
+    stateEnter(GAME_STATE_MATCHING);
+}
+
+// ============================================================================
 // 弾生成（spawn_bullet_ex を写像）
 //   big=true で大弾(長ため/貫通/高速/ダメージ3)、false で小弾(短ため)
 // ============================================================================
@@ -349,7 +389,10 @@ function gameOnRx(data) {
     // 相手が決着を通知 -> 相手の結果の裏返しで自分も即終了（両機同時終了）
     if (flags & GAME_PKT_FLAG_GAMEOVER) {
         const rc = (flags & GAME_PKT_RESULT_MASK) >> GAME_PKT_RESULT_SHIFT;
-        if (G.state !== GAME_STATE_RESULT) {
+        // GAMEOVER は対戦中(PLAYING/COUNTDOWN)のみ受理。RESULT 中や、連続プレイで
+        // 再 MATCHING に戻った直後に相手の「古い GAMEOVER」が届いても、新ゲームを
+        // いきなり終了させない（firmware と対称）。
+        if (G.state === GAME_STATE_PLAYING || G.state === GAME_STATE_COUNTDOWN) {
             if (rc === GAME_RES_WIN) G.result = GAME_RESULT_LOSE;
             else if (rc === GAME_RES_LOSE) G.result = GAME_RESULT_WIN;
             else G.result = GAME_RESULT_DRAW;
@@ -544,6 +587,10 @@ function gameTick(nowMs) {
         }
 
         case GAME_STATE_RESULT:
+            // 連続プレイ: 一定時間 RESULT を見せたら自動で次戦へ戻る（firmware と対称）。
+            if (nowMs - G.stateEnterMs >= GAME_RESULT_HOLD_MS) {
+                gameRestart();
+            }
             break;
     }
 
@@ -1127,7 +1174,8 @@ if (typeof module !== 'undefined' && module.exports) {
         // pure helpers
         seqIsNewer, clampI, bulletHitsShip, viewPhysY,
         // engine (operate on module-level G; a captured-send hook is injected for tests)
-        G, gameInit, gameOnInput, gameOnRx, gameTick,
+        G, gameInit, gameRestart, gameOnInput, gameOnRx, gameTick,
+        GAME_RESULT_HOLD_MS,
         _setSendHook(fn) { _testSendHook = fn; },
     };
 }
