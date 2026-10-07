@@ -311,7 +311,9 @@ async function setupTransport(transport) {
     const cfg = TRANSPORT_MODULES[transport] || TRANSPORT_MODULES.pcm;
 
     // Encoder (TX)
-    await audioContext.audioWorklet.addModule(cfg.encoderModule);
+    // worklet はブラウザに強くキャッシュされるため、バージョンクエリで無効化する。
+    const _WL_VER = '?v=' + Date.now();
+    await audioContext.audioWorklet.addModule(cfg.encoderModule + _WL_VER);
     encoderNode = new AudioWorkletNode(audioContext, cfg.encoderNode, { outputChannelCount: [1] });
     encoderNode.port.onmessage = (e) => {
         if (e.data.type === 'tx_start') console.log('[ENC] TX queued, qLen=' + e.data.queueLen + ' fLen=' + e.data.frameLen);
@@ -321,7 +323,7 @@ async function setupTransport(transport) {
 
     // Decoder (RX) - requires an existing mediaStream source
     if (mediaStream) {
-        await audioContext.audioWorklet.addModule(cfg.decoderModule);
+        await audioContext.audioWorklet.addModule(cfg.decoderModule + _WL_VER);
         decoderNode = new AudioWorkletNode(audioContext, cfg.decoderNode, { numberOfInputs: 1, numberOfOutputs: 0, channelCount: 1 });
         decoderNode.port.onmessage = (e) => handleRx(e.data);
         const source = audioContext.createMediaStreamSource(mediaStream);

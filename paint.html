@@ -3,6 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <!-- キャッシュ対策: GitHub Pages はHTTPヘッダを設定できないため、HTML側で
+         強制的に再取得させる。古い paint.html / paint.js を掴まなくなる。 -->
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <title>FSK Paint - おえかき通信</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -88,6 +93,14 @@
     <div class="progress"><div class="progress-bar" id="progressBar"></div></div>
     <div class="log" id="log"></div>
 
-    <script type="module" src="paint.js"></script>
+    <!-- キャッシュ対策: paint.js(ESモジュール)をロード時刻付きで動的読み込みし常に最新を取得 -->
+    <script>
+        (function () {
+            var s = document.createElement('script');
+            s.type = 'module';
+            s.src = 'paint.js?v=' + Date.now();
+            document.body.appendChild(s);
+        })();
+    </script>
 </body>
 </html>

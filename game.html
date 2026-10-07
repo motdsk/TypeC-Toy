@@ -3,6 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <!-- キャッシュ対策: GitHub Pages はHTTPヘッダを設定できないため、HTML側で
+         強制的に再取得させる。これで古い game.html / game.js を掴まなくなる。 -->
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <title>Shooter 対戦 - PCM直接搬送</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -78,6 +83,14 @@
 
     <div class="log" id="log"></div>
 
-    <script src="game.js"></script>
+    <!-- キャッシュ対策: game.js をロード時刻付きで動的読み込みし、常に最新を取得する。
+         (worklet js は game.js 内で既にバージョンクエリ付きで読み込み済み) -->
+    <script>
+        (function () {
+            var s = document.createElement('script');
+            s.src = 'game.js?v=' + Date.now();
+            document.body.appendChild(s);
+        })();
+    </script>
 </body>
 </html>
